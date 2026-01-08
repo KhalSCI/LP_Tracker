@@ -104,6 +104,79 @@ class RiotAPI:
             "ranked": ranked,
         }
 
+    async def get_match_ids_by_puuid(
+        self,
+        puuid: str,
+        queue: int = 420,
+        count: int = 5,
+        start_time: int = None
+    ) -> list[str]:
+        """
+        Get recent match IDs for a player.
+
+        Args:
+            puuid: Player's PUUID
+            queue: Queue ID (420 = Ranked Solo/Duo, 440 = Flex)
+            count: Number of matches to retrieve (max 100)
+            start_time: Unix timestamp in seconds - only get matches after this time
+
+        Returns:
+            List of match IDs (e.g., ["EUW1_1234567890", ...])
+        """
+        url = f"{RIOT_ACCOUNT_API}/lol/match/v5/matches/by-puuid/{puuid}/ids?queue={queue}&count={count}"
+        if start_time:
+            url += f"&startTime={start_time}"
+        return await self._request(url)
+
+    async def get_match_details(self, match_id: str) -> dict:
+        """
+        Get detailed information about a specific match.
+
+        Args:
+            match_id: Match ID (e.g., "EUW1_1234567890")
+
+        Returns:
+            Match data including participants, KDA, champions, win/loss, etc.
+        """
+        url = f"{RIOT_ACCOUNT_API}/lol/match/v5/matches/{match_id}"
+        return await self._request(url)
+
+    def extract_player_match_stats(self, match_data: dict, puuid: str) -> dict | None:
+        """
+        Extract relevant stats for a specific player from match data.
+
+        Returns:
+            Dict with match stats or None if player not found in match.
+        """
+        info = match_data.get("info", {})
+        participants = info.get("participants", [])
+
+        for participant in participants:
+            if participant.get("puuid") == puuid:
+                kills = participant.get("kills", 0)
+                deaths = participant.get("deaths", 0)
+                assists = participant.get("assists", 0)
+
+                # Calculate KDA ratio (avoid division by zero)
+                kda_ratio = (kills + assists) / max(deaths, 1)
+
+                return {
+                    "match_id": match_data.get("metadata", {}).get("matchId"),
+                    "win": participant.get("win", False),
+                    "champion_name": participant.get("championName", "Unknown"),
+                    "champion_id": participant.get("championId", 0),
+                    "kills": kills,
+                    "deaths": deaths,
+                    "assists": assists,
+                    "kda_ratio": round(kda_ratio, 2),
+                    "cs": participant.get("totalMinionsKilled", 0) + participant.get("neutralMinionsKilled", 0),
+                    "game_duration_minutes": info.get("gameDuration", 0) // 60,
+                    "game_end_timestamp": info.get("gameEndTimestamp", 0),
+                    "queue_id": info.get("queueId", 0),
+                }
+
+        return None
+
 
 # Global instance
 riot_api = RiotAPI()

@@ -7,6 +7,7 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 RIOT_API_KEY = os.getenv("RIOT_API_KEY")
 UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", 3600))
+NOTIFICATION_INTERVAL = int(os.getenv("NOTIFICATION_INTERVAL", 300))  # 5 minutes
 TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "UTC"))
 
 # Riot API endpoints

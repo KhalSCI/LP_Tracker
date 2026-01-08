@@ -7,6 +7,8 @@ import database as db
 from riot_api import riot_api, RiotAPIError
 from config import RANK_ORDER, DIVISION_ORDER, TIMEZONE
 
+AUTO_DELETE_SECONDS = 60
+
 
 def sort_players(players: list[dict]) -> list[dict]:
     """Sort players by rank (highest first)."""
@@ -112,16 +114,18 @@ class TrackerCog(commands.Cog):
         # Check if leaderboard already exists
         existing = await db.get_leaderboard(interaction.guild_id, name)
         if existing:
-            await interaction.followup.send(f"❌ A leaderboard named **{name}** already exists.")
+            msg = await interaction.followup.send(f"❌ A leaderboard named **{name}** already exists.", wait=True)
+            await msg.delete(delay=AUTO_DELETE_SECONDS)
             return
 
         channel_id = channel.id if channel else None
         await db.create_leaderboard(interaction.guild_id, name, channel_id)
 
-        msg = f"✅ Created leaderboard **{name}**"
+        text = f"✅ Created leaderboard **{name}**"
         if channel:
-            msg += f" with auto-updates in {channel.mention}"
-        await interaction.followup.send(msg)
+            text += f" with auto-updates in {channel.mention}"
+        msg = await interaction.followup.send(text, wait=True)
+        await msg.delete(delay=AUTO_DELETE_SECONDS)
 
     @leaderboard_group.command(name="delete", description="Delete a leaderboard")
     @app_commands.describe(name="Name of the leaderboard to delete")
@@ -130,9 +134,10 @@ class TrackerCog(commands.Cog):
 
         deleted = await db.delete_leaderboard(interaction.guild_id, name)
         if deleted:
-            await interaction.followup.send(f"✅ Deleted leaderboard **{name}** and all its players.")
+            msg = await interaction.followup.send(f"✅ Deleted leaderboard **{name}** and all its players.", wait=True)
         else:
-            await interaction.followup.send(f"❌ Leaderboard **{name}** not found.")
+            msg = await interaction.followup.send(f"❌ Leaderboard **{name}** not found.", wait=True)
+        await msg.delete(delay=AUTO_DELETE_SECONDS)
 
     @leaderboard_group.command(name="setchannel", description="Set auto-update channel for a leaderboard")
     @app_commands.describe(
@@ -149,11 +154,13 @@ class TrackerCog(commands.Cog):
 
         updated = await db.set_leaderboard_channel(interaction.guild_id, name, channel.id)
         if updated:
-            await interaction.followup.send(
-                f"✅ Leaderboard **{name}** will now post updates to {channel.mention}"
+            msg = await interaction.followup.send(
+                f"✅ Leaderboard **{name}** will now post updates to {channel.mention}",
+                wait=True
             )
         else:
-            await interaction.followup.send(f"❌ Leaderboard **{name}** not found.")
+            msg = await interaction.followup.send(f"❌ Leaderboard **{name}** not found.", wait=True)
+        await msg.delete(delay=AUTO_DELETE_SECONDS)
 
     @leaderboard_group.command(name="show", description="Display a leaderboard")
     @app_commands.describe(name="Name of the leaderboard to display")
@@ -162,12 +169,14 @@ class TrackerCog(commands.Cog):
 
         leaderboard = await db.get_leaderboard(interaction.guild_id, name)
         if not leaderboard:
-            await interaction.followup.send(f"❌ Leaderboard **{name}** not found.")
+            msg = await interaction.followup.send(f"❌ Leaderboard **{name}** not found.", wait=True)
+            await msg.delete(delay=AUTO_DELETE_SECONDS)
             return
 
         players = await db.get_leaderboard_players(leaderboard["id"])
         embed = await create_leaderboard_embed(leaderboard, players)
-        await interaction.followup.send(embed=embed)
+        msg = await interaction.followup.send(embed=embed, wait=True)
+        await msg.delete(delay=AUTO_DELETE_SECONDS)
 
     @leaderboard_group.command(name="list", description="List all leaderboards in this server")
     async def leaderboard_list(self, interaction: discord.Interaction):
@@ -176,7 +185,8 @@ class TrackerCog(commands.Cog):
         leaderboards = await db.get_guild_leaderboards(interaction.guild_id)
 
         if not leaderboards:
-            await interaction.followup.send("No leaderboards found. Use `/leaderboard create` to create one.")
+            msg = await interaction.followup.send("No leaderboards found. Use `/leaderboard create` to create one.", wait=True)
+            await msg.delete(delay=AUTO_DELETE_SECONDS)
             return
 
         embed = discord.Embed(
@@ -193,7 +203,8 @@ class TrackerCog(commands.Cog):
                 inline=True
             )
 
-        await interaction.followup.send(embed=embed)
+        msg = await interaction.followup.send(embed=embed, wait=True)
+        await msg.delete(delay=AUTO_DELETE_SECONDS)
 
     # Player command group
     player_group = app_commands.Group(name="player", description="Manage players")
@@ -209,18 +220,21 @@ class TrackerCog(commands.Cog):
         # Validate leaderboard exists
         lb = await db.get_leaderboard(interaction.guild_id, leaderboard)
         if not lb:
-            await interaction.followup.send(f"❌ Leaderboard **{leaderboard}** not found.")
+            msg = await interaction.followup.send(f"❌ Leaderboard **{leaderboard}** not found.", wait=True)
+            await msg.delete(delay=AUTO_DELETE_SECONDS)
             return
 
         # Check if player already exists
         existing = await db.get_player(lb["id"], riot_id)
         if existing:
-            await interaction.followup.send(f"❌ **{riot_id}** is already in **{leaderboard}**.")
+            msg = await interaction.followup.send(f"❌ **{riot_id}** is already in **{leaderboard}**.", wait=True)
+            await msg.delete(delay=AUTO_DELETE_SECONDS)
             return
 
         # Parse Riot ID
         if "#" not in riot_id:
-            await interaction.followup.send("❌ Invalid Riot ID format. Use `Name#Tag` (e.g., `PlayerName#EUW`)")
+            msg = await interaction.followup.send("❌ Invalid Riot ID format. Use `Name#Tag` (e.g., `PlayerName#EUW`)", wait=True)
+            await msg.delete(delay=AUTO_DELETE_SECONDS)
             return
 
         game_name, tag_line = riot_id.rsplit("#", 1)
@@ -230,11 +244,12 @@ class TrackerCog(commands.Cog):
             player_info = await riot_api.get_player_full_info(game_name, tag_line)
         except RiotAPIError as e:
             if e.status == 404:
-                await interaction.followup.send(f"❌ Player **{riot_id}** not found. Check the name and tag.")
+                msg = await interaction.followup.send(f"❌ Player **{riot_id}** not found. Check the name and tag.", wait=True)
             elif e.status == 403:
-                await interaction.followup.send("❌ Riot API key is invalid or expired. Please update it.")
+                msg = await interaction.followup.send("❌ Riot API key is invalid or expired. Please update it.", wait=True)
             else:
-                await interaction.followup.send(f"❌ Error fetching player: {e.message}")
+                msg = await interaction.followup.send(f"❌ Error fetching player: {e.message}", wait=True)
+            await msg.delete(delay=AUTO_DELETE_SECONDS)
             return
 
         # Add player to database
@@ -256,15 +271,18 @@ class TrackerCog(commands.Cog):
                 ranked["losses"]
             )
             rank_str = format_rank(ranked["tier"], ranked["rank"], ranked["lp"])
-            await interaction.followup.send(
+            msg = await interaction.followup.send(
                 f"✅ Added **{player_info['game_name']}#{player_info['tag_line']}** to **{leaderboard}**\n"
-                f"   Current rank: {rank_str}"
+                f"   Current rank: {rank_str}",
+                wait=True
             )
         else:
-            await interaction.followup.send(
+            msg = await interaction.followup.send(
                 f"✅ Added **{player_info['game_name']}#{player_info['tag_line']}** to **{leaderboard}**\n"
-                f"   Current rank: Unranked"
+                f"   Current rank: Unranked",
+                wait=True
             )
+        await msg.delete(delay=AUTO_DELETE_SECONDS)
 
     @player_group.command(name="remove", description="Remove a player from a leaderboard")
     @app_commands.describe(
@@ -276,14 +294,16 @@ class TrackerCog(commands.Cog):
 
         lb = await db.get_leaderboard(interaction.guild_id, leaderboard)
         if not lb:
-            await interaction.followup.send(f"❌ Leaderboard **{leaderboard}** not found.")
+            msg = await interaction.followup.send(f"❌ Leaderboard **{leaderboard}** not found.", wait=True)
+            await msg.delete(delay=AUTO_DELETE_SECONDS)
             return
 
         removed = await db.remove_player(lb["id"], riot_id)
         if removed:
-            await interaction.followup.send(f"✅ Removed **{riot_id}** from **{leaderboard}**.")
+            msg = await interaction.followup.send(f"✅ Removed **{riot_id}** from **{leaderboard}**.", wait=True)
         else:
-            await interaction.followup.send(f"❌ **{riot_id}** not found in **{leaderboard}**.")
+            msg = await interaction.followup.send(f"❌ **{riot_id}** not found in **{leaderboard}**.", wait=True)
+        await msg.delete(delay=AUTO_DELETE_SECONDS)
 
     @app_commands.command(name="refresh", description="Manually refresh all player stats for a leaderboard")
     @app_commands.describe(leaderboard="Name of the leaderboard to refresh")
@@ -292,12 +312,14 @@ class TrackerCog(commands.Cog):
 
         lb = await db.get_leaderboard(interaction.guild_id, leaderboard)
         if not lb:
-            await interaction.followup.send(f"❌ Leaderboard **{leaderboard}** not found.")
+            msg = await interaction.followup.send(f"❌ Leaderboard **{leaderboard}** not found.", wait=True)
+            await msg.delete(delay=AUTO_DELETE_SECONDS)
             return
 
         players = await db.get_leaderboard_players(lb["id"])
         if not players:
-            await interaction.followup.send(f"❌ No players in **{leaderboard}** to refresh.")
+            msg = await interaction.followup.send(f"❌ No players in **{leaderboard}** to refresh.", wait=True)
+            await msg.delete(delay=AUTO_DELETE_SECONDS)
             return
 
         updated = 0
@@ -324,11 +346,12 @@ class TrackerCog(commands.Cog):
         players = await db.get_leaderboard_players(lb["id"])
         embed = await create_leaderboard_embed(lb, players)
 
-        msg = f"✅ Refreshed **{updated}** players"
+        text = f"✅ Refreshed **{updated}** players"
         if errors:
-            msg += f" ({errors} errors)"
+            text += f" ({errors} errors)"
 
-        await interaction.followup.send(msg, embed=embed)
+        msg = await interaction.followup.send(text, embed=embed, wait=True)
+        await msg.delete(delay=AUTO_DELETE_SECONDS)
 
 
 async def setup(bot: commands.Bot):

@@ -1,0 +1,15 @@
+[Unit]
+Description=LP Tracker Discord Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=khal
+WorkingDirectory=/home/khal/LP_Tracker
+ExecStart=/home/khal/LP_Tracker/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

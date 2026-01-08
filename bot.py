@@ -4,8 +4,9 @@ from discord.ext import commands, tasks
 
 import database as db
 from riot_api import riot_api, RiotAPIError
-from config import DISCORD_TOKEN, UPDATE_INTERVAL
+from config import DISCORD_TOKEN, UPDATE_INTERVAL, NOTIFICATION_INTERVAL
 from cogs.tracker import create_leaderboard_embed
+from cogs.notifications import create_match_notification_embed
 
 
 class LPTrackerBot(commands.Bot):
@@ -24,17 +25,27 @@ class LPTrackerBot(commands.Bot):
 
         # Load cogs
         await self.load_extension("cogs.tracker")
+        await self.load_extension("cogs.notifications")
 
         # Sync slash commands
         await self.tree.sync()
         print("Slash commands synced!")
 
-        # Start background task
+        # Start background tasks
         self.update_leaderboards.start()
+        self.check_match_notifications.start()
 
     async def on_ready(self):
         print(f"Logged in as {self.user} (ID: {self.user.id})")
         print(f"Connected to {len(self.guilds)} guild(s)")
+        # Sync commands to all guilds for immediate availability
+        for guild in self.guilds:
+            try:
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+                print(f"Synced commands to {guild.name}")
+            except Exception as e:
+                print(f"Failed to sync to {guild.name}: {e}")
         print("------")
 
     async def close(self):
@@ -105,6 +116,93 @@ class LPTrackerBot(commands.Bot):
 
     @update_leaderboards.before_loop
     async def before_update(self):
+        await self.wait_until_ready()
+
+    @tasks.loop(seconds=NOTIFICATION_INTERVAL)
+    async def check_match_notifications(self):
+        """Background task to check for new matches and send notifications."""
+        print("Checking for new matches...")
+
+        # Get all guilds with notification channels
+        guilds = await db.get_guilds_with_notifications()
+
+        for guild_config in guilds:
+            guild_id = guild_config["guild_id"]
+            channel_id = guild_config["notification_channel_id"]
+            enabled_at = guild_config.get("notifications_enabled_at")
+
+            # Convert enabled_at to milliseconds timestamp for comparison with Riot API
+            if enabled_at:
+                from datetime import datetime
+                if isinstance(enabled_at, str):
+                    enabled_at_dt = datetime.fromisoformat(enabled_at)
+                else:
+                    enabled_at_dt = enabled_at
+                enabled_at_ms = int(enabled_at_dt.timestamp() * 1000)
+            else:
+                enabled_at_ms = 0
+
+            channel = self.get_channel(channel_id)
+            if not channel:
+                continue
+
+            # Get unique players for this guild (deduplicated across leaderboards)
+            players = await db.get_unique_players_for_guild(guild_id)
+
+            for player in players:
+                try:
+                    # Get recent matches (last 5 ranked Solo/Duo games)
+                    match_ids = await riot_api.get_match_ids_by_puuid(
+                        player["puuid"],
+                        queue=420,  # Ranked Solo/Duo
+                        count=5
+                    )
+
+                    for match_id in match_ids:
+                        # Check if already notified
+                        if await db.is_match_notified(guild_id, match_id, player["puuid"]):
+                            continue
+
+                        # Get match details
+                        match_data = await riot_api.get_match_details(match_id)
+                        match_stats = riot_api.extract_player_match_stats(
+                            match_data,
+                            player["puuid"]
+                        )
+
+                        if not match_stats:
+                            continue
+
+                        # Skip matches that ended before notifications were enabled
+                        if match_stats["game_end_timestamp"] < enabled_at_ms:
+                            # Mark as notified to avoid checking again
+                            await db.mark_match_notified(guild_id, match_id, player["puuid"])
+                            continue
+
+                        # Create and send notification
+                        embed = create_match_notification_embed(
+                            player["riot_id"],
+                            match_stats
+                        )
+                        await channel.send(embed=embed)
+
+                        # Mark as notified
+                        await db.mark_match_notified(guild_id, match_id, player["puuid"])
+
+                        # Small delay to avoid Discord rate limits
+                        await asyncio.sleep(1)
+
+                    # Rate limit delay between players
+                    await asyncio.sleep(0.5)
+
+                except RiotAPIError as e:
+                    print(f"Error checking matches for {player['riot_id']}: {e}")
+
+        # Periodic cleanup of old match records
+        await db.cleanup_old_notified_matches(days=7)
+
+    @check_match_notifications.before_loop
+    async def before_match_check(self):
         await self.wait_until_ready()
 
 
