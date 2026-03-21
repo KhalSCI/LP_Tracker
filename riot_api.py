@@ -160,6 +160,12 @@ class RiotAPI:
                 # Calculate KDA ratio (avoid division by zero)
                 kda_ratio = (kills + assists) / max(deaths, 1)
 
+                # Calculate CS per minute
+                total_cs = participant.get("totalMinionsKilled", 0) + participant.get("neutralMinionsKilled", 0)
+                game_duration_seconds = info.get("gameDuration", 0)
+                game_duration_minutes = game_duration_seconds / 60
+                cs_per_min = round(total_cs / max(game_duration_minutes, 1), 2)
+
                 return {
                     "match_id": match_data.get("metadata", {}).get("matchId"),
                     "win": participant.get("win", False),
@@ -169,8 +175,9 @@ class RiotAPI:
                     "deaths": deaths,
                     "assists": assists,
                     "kda_ratio": round(kda_ratio, 2),
-                    "cs": participant.get("totalMinionsKilled", 0) + participant.get("neutralMinionsKilled", 0),
-                    "game_duration_minutes": info.get("gameDuration", 0) // 60,
+                    "cs": total_cs,
+                    "cs_per_min": cs_per_min,
+                    "game_duration_minutes": int(game_duration_minutes),
                     "game_end_timestamp": info.get("gameEndTimestamp", 0),
                     "queue_id": info.get("queueId", 0),
                 }

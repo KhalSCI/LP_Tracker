@@ -120,16 +120,20 @@ class LPTrackerBot(commands.Bot):
 
     @tasks.loop(seconds=NOTIFICATION_INTERVAL)
     async def check_match_notifications(self):
-        """Background task to check for new matches and send notifications."""
+        """Background task to check for new matches and send notifications (per-leaderboard)."""
         print("Checking for new matches...")
 
-        # Get all guilds with notification channels
-        guilds = await db.get_guilds_with_notifications()
+        # Get all leaderboards with notification channels enabled
+        leaderboards = await db.get_leaderboards_with_notifications()
 
-        for guild_config in guilds:
-            guild_id = guild_config["guild_id"]
-            channel_id = guild_config["notification_channel_id"]
-            enabled_at = guild_config.get("notifications_enabled_at")
+        # Cache match data to avoid redundant API calls for same player
+        match_cache = {}  # {match_id: match_data}
+        player_matches_cache = {}  # {puuid: [match_ids]}
+
+        for lb in leaderboards:
+            leaderboard_id = lb["id"]
+            channel_id = lb["notification_channel_id"]
+            enabled_at = lb.get("notifications_enabled_at")
 
             # Convert enabled_at to milliseconds timestamp for comparison with Riot API
             if enabled_at:
@@ -146,28 +150,41 @@ class LPTrackerBot(commands.Bot):
             if not channel:
                 continue
 
-            # Get unique players for this guild (deduplicated across leaderboards)
-            players = await db.get_unique_players_for_guild(guild_id)
+            # Get players for this leaderboard
+            players = await db.get_players_for_leaderboard_notifications(leaderboard_id)
 
             for player in players:
+                puuid = player["puuid"]
+
                 try:
-                    # Get recent matches (last 5 ranked Solo/Duo games)
-                    match_ids = await riot_api.get_match_ids_by_puuid(
-                        player["puuid"],
-                        queue=420,  # Ranked Solo/Duo
-                        count=5
-                    )
+                    # Check cache for match IDs, otherwise fetch
+                    if puuid not in player_matches_cache:
+                        match_ids = await riot_api.get_match_ids_by_puuid(
+                            puuid,
+                            queue=420,  # Ranked Solo/Duo
+                            count=5
+                        )
+                        player_matches_cache[puuid] = match_ids
+                        await asyncio.sleep(0.5)  # Rate limit
+                    else:
+                        match_ids = player_matches_cache[puuid]
 
                     for match_id in match_ids:
-                        # Check if already notified
-                        if await db.is_match_notified(guild_id, match_id, player["puuid"]):
+                        # Check if already notified for THIS leaderboard
+                        if await db.is_match_notified(leaderboard_id, match_id, puuid):
                             continue
 
-                        # Get match details
-                        match_data = await riot_api.get_match_details(match_id)
+                        # Check cache for match details, otherwise fetch
+                        if match_id not in match_cache:
+                            match_data = await riot_api.get_match_details(match_id)
+                            match_cache[match_id] = match_data
+                            await asyncio.sleep(0.5)  # Rate limit
+                        else:
+                            match_data = match_cache[match_id]
+
                         match_stats = riot_api.extract_player_match_stats(
                             match_data,
-                            player["puuid"]
+                            puuid
                         )
 
                         if not match_stats:
@@ -176,7 +193,7 @@ class LPTrackerBot(commands.Bot):
                         # Skip matches that ended before notifications were enabled
                         if match_stats["game_end_timestamp"] < enabled_at_ms:
                             # Mark as notified to avoid checking again
-                            await db.mark_match_notified(guild_id, match_id, player["puuid"])
+                            await db.mark_match_notified(leaderboard_id, match_id, puuid)
                             continue
 
                         # Create and send notification
@@ -186,14 +203,11 @@ class LPTrackerBot(commands.Bot):
                         )
                         await channel.send(embed=embed)
 
-                        # Mark as notified
-                        await db.mark_match_notified(guild_id, match_id, player["puuid"])
+                        # Mark as notified for this leaderboard
+                        await db.mark_match_notified(leaderboard_id, match_id, puuid)
 
                         # Small delay to avoid Discord rate limits
                         await asyncio.sleep(1)
-
-                    # Rate limit delay between players
-                    await asyncio.sleep(0.5)
 
                 except RiotAPIError as e:
                     print(f"Error checking matches for {player['riot_id']}: {e}")

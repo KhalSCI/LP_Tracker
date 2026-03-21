@@ -40,10 +40,10 @@ def create_match_notification_embed(riot_id: str, match_stats: dict) -> discord.
         inline=True
     )
 
-    # CS field
+    # CS/min field
     embed.add_field(
-        name="CS",
-        value=str(match_stats["cs"]),
+        name="CS/min",
+        value=str(match_stats["cs_per_min"]),
         inline=True
     )
 
@@ -64,7 +64,7 @@ def create_match_notification_embed(riot_id: str, match_stats: dict) -> discord.
 
 
 class NotificationsCog(commands.Cog):
-    """Cog for win/loss notification commands."""
+    """Cog for win/loss notification commands (per-leaderboard)."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -74,65 +74,111 @@ class NotificationsCog(commands.Cog):
         description="Manage win/loss notifications"
     )
 
-    @notifications_group.command(name="setchannel", description="Set the channel for win/loss notifications")
-    @app_commands.describe(channel="Channel for win/loss notifications")
+    async def leaderboard_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Autocomplete for leaderboard names."""
+        leaderboards = await db.get_guild_leaderboards(interaction.guild_id)
+        choices = [
+            app_commands.Choice(name=lb["name"], value=lb["name"])
+            for lb in leaderboards
+            if current.lower() in lb["name"].lower()
+        ]
+        return choices[:25]  # Discord limit
+
+    @notifications_group.command(name="setchannel", description="Set the notification channel for a leaderboard")
+    @app_commands.describe(
+        leaderboard="Name of the leaderboard",
+        channel="Channel for win/loss notifications"
+    )
+    @app_commands.autocomplete(leaderboard=leaderboard_autocomplete)
     async def set_channel(
         self,
         interaction: discord.Interaction,
+        leaderboard: str,
         channel: discord.TextChannel
     ):
         await interaction.response.defer()
 
-        await db.set_notification_channel(interaction.guild_id, channel.id)
-        msg = await interaction.followup.send(
-            f"✅ Win/loss notifications will be sent to {channel.mention}",
-            wait=True
-        )
-        await msg.delete(delay=AUTO_DELETE_SECONDS)
-
-    @notifications_group.command(name="disable", description="Disable win/loss notifications")
-    async def disable(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-
-        disabled = await db.disable_notifications(interaction.guild_id)
-        if disabled:
-            msg = await interaction.followup.send("✅ Win/loss notifications have been disabled.", wait=True)
-        else:
-            msg = await interaction.followup.send("❌ Notifications were not enabled for this server.", wait=True)
-        await msg.delete(delay=AUTO_DELETE_SECONDS)
-
-    @notifications_group.command(name="status", description="Show current notification settings")
-    async def status(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-
-        settings = await db.get_guild_settings(interaction.guild_id)
-
-        if not settings or not settings.get("notification_channel_id"):
+        # Check if leaderboard exists
+        lb = await db.get_leaderboard(interaction.guild_id, leaderboard)
+        if not lb:
             msg = await interaction.followup.send(
-                "**Notification Status**\n"
-                "Channel: Not configured\n"
-                "Use `/notifications setchannel` to enable notifications.",
+                f"Leaderboard '{leaderboard}' not found.",
                 wait=True
             )
             await msg.delete(delay=AUTO_DELETE_SECONDS)
             return
 
-        channel_id = settings["notification_channel_id"]
-        enabled = settings.get("notifications_enabled", False)
-
-        status_text = "Enabled" if enabled else "Disabled"
-        channel_mention = f"<#{channel_id}>"
-
-        # Count tracked players
-        players = await db.get_unique_players_for_guild(interaction.guild_id)
-
-        msg = await interaction.followup.send(
-            f"**Notification Status**\n"
-            f"Channel: {channel_mention}\n"
-            f"Status: {status_text}\n"
-            f"Tracking: {len(players)} unique player(s)",
-            wait=True
+        success = await db.set_leaderboard_notification_channel(
+            interaction.guild_id,
+            leaderboard,
+            channel.id
         )
+
+        if success:
+            msg = await interaction.followup.send(
+                f"Win/loss notifications for **{leaderboard}** will be sent to {channel.mention}",
+                wait=True
+            )
+        else:
+            msg = await interaction.followup.send(
+                f"Failed to set notification channel for '{leaderboard}'.",
+                wait=True
+            )
+        await msg.delete(delay=AUTO_DELETE_SECONDS)
+
+    @notifications_group.command(name="disable", description="Disable notifications for a leaderboard")
+    @app_commands.describe(leaderboard="Name of the leaderboard")
+    @app_commands.autocomplete(leaderboard=leaderboard_autocomplete)
+    async def disable(self, interaction: discord.Interaction, leaderboard: str):
+        await interaction.response.defer()
+
+        disabled = await db.disable_leaderboard_notifications(interaction.guild_id, leaderboard)
+        if disabled:
+            msg = await interaction.followup.send(
+                f"Notifications for **{leaderboard}** have been disabled.",
+                wait=True
+            )
+        else:
+            msg = await interaction.followup.send(
+                f"Leaderboard '{leaderboard}' not found or notifications were not enabled.",
+                wait=True
+            )
+        await msg.delete(delay=AUTO_DELETE_SECONDS)
+
+    @notifications_group.command(name="status", description="Show notification settings for all leaderboards")
+    async def status(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+
+        leaderboards = await db.get_guild_leaderboards(interaction.guild_id)
+
+        if not leaderboards:
+            msg = await interaction.followup.send(
+                "**Notification Status**\n"
+                "No leaderboards found. Create one with `/leaderboard create`.",
+                wait=True
+            )
+            await msg.delete(delay=AUTO_DELETE_SECONDS)
+            return
+
+        status_lines = ["**Notification Status**\n"]
+
+        for lb in leaderboards:
+            name = lb["name"]
+            channel_id = lb.get("notification_channel_id")
+            enabled = lb.get("notifications_enabled", False)
+
+            if channel_id and enabled:
+                channel_mention = f"<#{channel_id}>"
+                players = await db.get_leaderboard_players(lb["id"])
+                status_lines.append(f"**{name}**: {channel_mention} ({len(players)} players)")
+            else:
+                status_lines.append(f"**{name}**: Disabled")
+
+        msg = await interaction.followup.send("\n".join(status_lines), wait=True)
         await msg.delete(delay=AUTO_DELETE_SECONDS)
 
 
