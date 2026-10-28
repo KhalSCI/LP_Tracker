@@ -63,6 +63,14 @@ class RiotAPI:
         url = f"{RIOT_ACCOUNT_API}/riot/account/v1/accounts/by-riot-id/{encoded_name}/{encoded_tag}"
         return await self._request(url)
 
+    async def get_account_region(self, puuid: str) -> str:
+        """
+        Get the LoL platform an account plays on (e.g., 'euw1', 'eun1').
+        """
+        url = f"{RIOT_ACCOUNT_API}/riot/account/v1/region/by-game/lol/by-puuid/{puuid}"
+        account_region = await self._request(url)
+        return account_region.get("region", "").lower()
+
     async def get_ranked_stats_by_puuid(self, puuid: str) -> dict | None:
         """
         Get ranked stats by PUUID.
@@ -94,6 +102,9 @@ class RiotAPI:
         account = await self.get_account_by_riot_id(game_name, tag_line)
         puuid = account["puuid"]
 
+        # Get the platform the account plays on (callers only accept EUW)
+        region = await self.get_account_region(puuid)
+
         # Get ranked stats directly by PUUID
         ranked = await self.get_ranked_stats_by_puuid(puuid)
 
@@ -101,6 +112,7 @@ class RiotAPI:
             "puuid": puuid,
             "game_name": account.get("gameName", game_name),
             "tag_line": account.get("tagLine", tag_line),
+            "region": region,
             "ranked": ranked,
         }
 

@@ -13,6 +13,7 @@ TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "UTC"))
 # Riot API endpoints
 RIOT_ACCOUNT_API = "https://europe.api.riotgames.com"
 RIOT_EUW_API = "https://euw1.api.riotgames.com"
+RIOT_EUW_PLATFORM = "euw1"  # Only accounts on this platform are tracked
 
 # Rank order for sorting (higher index = better rank)
 RANK_ORDER = {

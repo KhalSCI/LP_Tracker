@@ -164,6 +164,10 @@ class TestRiotAPI:
             account_url = f"{RIOT_ACCOUNT_API}/riot/account/v1/accounts/by-riot-id/Dziad/J0KER"
             mocked.get(account_url, payload=SAMPLE_ACCOUNT_RESPONSE)
 
+            # Mock region endpoint
+            region_url = f"{RIOT_ACCOUNT_API}/riot/account/v1/region/by-game/lol/by-puuid/abc123-puuid-xyz"
+            mocked.get(region_url, payload={"puuid": "abc123-puuid-xyz", "game": "lol", "region": "euw1"})
+
             # Mock ranked endpoint
             ranked_url = f"{RIOT_EUW_API}/lol/league/v4/entries/by-puuid/abc123-puuid-xyz"
             mocked.get(ranked_url, payload=SAMPLE_RANKED_RESPONSE)
@@ -174,6 +178,7 @@ class TestRiotAPI:
             assert result["puuid"] == "abc123-puuid-xyz"
             assert result["game_name"] == "Dziad"
             assert result["tag_line"] == "J0KER"
+            assert result["region"] == "euw1"
             assert result["ranked"] is not None
             assert result["ranked"]["tier"] == "DIAMOND"
             assert result["ranked"]["rank"] == "IV"
@@ -191,6 +196,10 @@ class TestRiotAPI:
                 "tagLine": "EUW"
             })
 
+            # Mock region endpoint
+            region_url = f"{RIOT_ACCOUNT_API}/riot/account/v1/region/by-game/lol/by-puuid/newplayer-puuid"
+            mocked.get(region_url, payload={"puuid": "newplayer-puuid", "game": "lol", "region": "euw1"})
+
             # Mock ranked endpoint (empty = unranked)
             ranked_url = f"{RIOT_EUW_API}/lol/league/v4/entries/by-puuid/newplayer-puuid"
             mocked.get(ranked_url, payload=[])
@@ -200,6 +209,29 @@ class TestRiotAPI:
 
             assert result["puuid"] == "newplayer-puuid"
             assert result["game_name"] == "NewPlayer"
+            assert result["ranked"] is None
+
+    @pytest.mark.asyncio
+    async def test_get_player_full_info_non_euw(self, api):
+        """Test get_player_full_info reports the region of a non-EUW account."""
+        with aioresponses() as mocked:
+            account_url = f"{RIOT_ACCOUNT_API}/riot/account/v1/accounts/by-riot-id/EunePlayer/EUNE"
+            mocked.get(account_url, payload={
+                "puuid": "eune-puuid",
+                "gameName": "EunePlayer",
+                "tagLine": "EUNE"
+            })
+
+            region_url = f"{RIOT_ACCOUNT_API}/riot/account/v1/region/by-game/lol/by-puuid/eune-puuid"
+            mocked.get(region_url, payload={"puuid": "eune-puuid", "game": "lol", "region": "eun1"})
+
+            ranked_url = f"{RIOT_EUW_API}/lol/league/v4/entries/by-puuid/eune-puuid"
+            mocked.get(ranked_url, payload=[])
+
+            result = await api.get_player_full_info("EunePlayer", "EUNE")
+            await api.close()
+
+            assert result["region"] == "eun1"
             assert result["ranked"] is None
 
     @pytest.mark.asyncio

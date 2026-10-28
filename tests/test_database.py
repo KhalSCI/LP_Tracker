@@ -151,6 +151,22 @@ class TestPlayers:
         assert player_id > 0
 
     @pytest.mark.asyncio
+    async def test_add_player_with_discord_name(self):
+        """Test that a player's Discord nick is stored with the account."""
+        import database as db
+        await db.init_db()
+
+        lb_id = await db.create_leaderboard(guild_id=123, name="test")
+        await db.add_player(lb_id, "nigelf42#yolo", "drewin-puuid", discord_name="drewin")
+        await db.add_player(lb_id, "NoNick#EUW", "nonick-puuid")
+
+        player = await db.get_player(lb_id, "nigelf42#yolo")
+        assert player["discord_name"] == "drewin"
+
+        player = await db.get_player(lb_id, "NoNick#EUW")
+        assert player["discord_name"] is None
+
+    @pytest.mark.asyncio
     async def test_get_player(self):
         """Test retrieving a player."""
         import database as db

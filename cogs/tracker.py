@@ -5,7 +5,7 @@ from datetime import datetime
 
 import database as db
 from riot_api import riot_api, RiotAPIError
-from config import RANK_ORDER, DIVISION_ORDER, TIMEZONE
+from config import RANK_ORDER, DIVISION_ORDER, TIMEZONE, RIOT_EUW_PLATFORM
 
 AUTO_DELETE_SECONDS = 60
 
@@ -66,7 +66,10 @@ async def create_leaderboard_embed(leaderboard: dict, players: list[dict]) -> di
     else:
         lines = []
         for i, player in enumerate(sorted_players, 1):
-            riot_id = player["riot_id"]
+            # Discord nick first, then the account
+            riot_id = discord.utils.escape_markdown(player["riot_id"])
+            nick = player.get("discord_name")
+            name = f"**{discord.utils.escape_markdown(nick)}** — {riot_id}" if nick else riot_id
             rank_str = format_rank(player.get("tier"), player.get("rank"), player.get("lp", 0))
             indicator = get_lp_change_indicator(
                 player.get("lp", 0),
@@ -79,9 +82,9 @@ async def create_leaderboard_embed(leaderboard: dict, players: list[dict]) -> di
             losses = player.get("losses", 0)
             if wins or losses:
                 winrate = round(wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
-                lines.append(f"**{i}.** {riot_id}\n   {rank_str}{indicator} ({wins}W/{losses}L - {winrate}%)")
+                lines.append(f"**{i}.** {name}\n   {rank_str}{indicator} ({wins}W/{losses}L - {winrate}%)")
             else:
-                lines.append(f"**{i}.** {riot_id}\n   {rank_str}{indicator}")
+                lines.append(f"**{i}.** {name}\n   {rank_str}{indicator}")
 
         embed.description = "\n\n".join(lines)
 
@@ -212,9 +215,10 @@ class TrackerCog(commands.Cog):
     @player_group.command(name="add", description="Add a player to a leaderboard")
     @app_commands.describe(
         leaderboard="Name of the leaderboard",
-        riot_id="Player's Riot ID (e.g., PlayerName#EUW)"
+        riot_id="Player's Riot ID (e.g., PlayerName#EUW)",
+        nick="Player's Discord nick, shown next to the account on the leaderboard"
     )
-    async def player_add(self, interaction: discord.Interaction, leaderboard: str, riot_id: str):
+    async def player_add(self, interaction: discord.Interaction, leaderboard: str, riot_id: str, nick: str):
         await interaction.response.defer()
 
         # Validate leaderboard exists
@@ -252,11 +256,22 @@ class TrackerCog(commands.Cog):
             await msg.delete(delay=AUTO_DELETE_SECONDS)
             return
 
+        # Only EUW accounts are tracked
+        if player_info["region"] != RIOT_EUW_PLATFORM:
+            msg = await interaction.followup.send(
+                f"❌ **{riot_id}** is not an EUW account (server: {player_info['region'].upper() or 'unknown'}). "
+                f"Only EUW accounts can be added.",
+                wait=True
+            )
+            await msg.delete(delay=AUTO_DELETE_SECONDS)
+            return
+
         # Add player to database
         player_id = await db.add_player(
             lb["id"],
             f"{player_info['game_name']}#{player_info['tag_line']}",
-            player_info["puuid"]
+            player_info["puuid"],
+            discord_name=nick
         )
 
         # Update rank if available
@@ -272,13 +287,13 @@ class TrackerCog(commands.Cog):
             )
             rank_str = format_rank(ranked["tier"], ranked["rank"], ranked["lp"])
             msg = await interaction.followup.send(
-                f"✅ Added **{player_info['game_name']}#{player_info['tag_line']}** to **{leaderboard}**\n"
+                f"✅ Added **{nick}** ({player_info['game_name']}#{player_info['tag_line']}) to **{leaderboard}**\n"
                 f"   Current rank: {rank_str}",
                 wait=True
             )
         else:
             msg = await interaction.followup.send(
-                f"✅ Added **{player_info['game_name']}#{player_info['tag_line']}** to **{leaderboard}**\n"
+                f"✅ Added **{nick}** ({player_info['game_name']}#{player_info['tag_line']}) to **{leaderboard}**\n"
                 f"   Current rank: Unranked",
                 wait=True
             )

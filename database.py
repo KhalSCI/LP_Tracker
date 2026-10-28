@@ -26,6 +26,7 @@ async def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 leaderboard_id INTEGER NOT NULL,
                 riot_id TEXT NOT NULL,
+                discord_name TEXT,
                 puuid TEXT,
                 summoner_id TEXT,
                 tier TEXT,
@@ -85,6 +86,14 @@ async def init_db():
         try:
             await db.execute(
                 "ALTER TABLE leaderboards ADD COLUMN notifications_enabled_at TIMESTAMP"
+            )
+        except Exception:
+            pass  # Column already exists
+
+        # Migration: Add Discord nickname column to players table if it doesn't exist
+        try:
+            await db.execute(
+                "ALTER TABLE players ADD COLUMN discord_name TEXT"
             )
         except Exception:
             pass  # Column already exists
@@ -201,13 +210,13 @@ async def set_leaderboard_message(leaderboard_id: int, message_id: int) -> None:
         await db.commit()
 
 
-async def add_player(leaderboard_id: int, riot_id: str, puuid: str) -> int:
+async def add_player(leaderboard_id: int, riot_id: str, puuid: str, discord_name: str = None) -> int:
     """Add a player to a leaderboard. Returns the player ID."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            """INSERT INTO players (leaderboard_id, riot_id, puuid, last_updated)
-               VALUES (?, ?, ?, ?)""",
-            (leaderboard_id, riot_id, puuid, datetime.utcnow())
+            """INSERT INTO players (leaderboard_id, riot_id, discord_name, puuid, last_updated)
+               VALUES (?, ?, ?, ?, ?)""",
+            (leaderboard_id, riot_id, discord_name, puuid, datetime.utcnow())
         )
         await db.commit()
         return cursor.lastrowid
