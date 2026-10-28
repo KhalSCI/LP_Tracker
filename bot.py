@@ -1,4 +1,5 @@
 import asyncio
+import time
 import discord
 from discord.ext import commands, tasks
 
@@ -7,6 +8,12 @@ from riot_api import riot_api, RiotAPIError
 from config import DISCORD_TOKEN, UPDATE_INTERVAL, NOTIFICATION_INTERVAL
 from cogs.tracker import create_leaderboard_embed
 from cogs.notifications import create_match_notification_embed
+
+# notified_matches records older than this are deleted after each match check
+NOTIFIED_MATCH_RETENTION_DAYS = 7
+# Only matches started within this window are checked. Must stay shorter than the
+# retention above, or a match whose record was cleaned up would be posted again.
+MATCH_LOOKBACK_SECONDS = 24 * 60 * 60
 
 
 class LPTrackerBot(commands.Bot):
@@ -130,6 +137,9 @@ class LPTrackerBot(commands.Bot):
         match_cache = {}  # {match_id: match_data}
         player_matches_cache = {}  # {puuid: [match_ids]}
 
+        # Only fetch recent matches, so old ones are never seen again once cleaned up
+        start_time = int(time.time()) - MATCH_LOOKBACK_SECONDS
+
         for lb in leaderboards:
             leaderboard_id = lb["id"]
             channel_id = lb["notification_channel_id"]
@@ -162,7 +172,8 @@ class LPTrackerBot(commands.Bot):
                         match_ids = await riot_api.get_match_ids_by_puuid(
                             puuid,
                             queue=420,  # Ranked Solo/Duo
-                            count=5
+                            count=5,
+                            start_time=start_time
                         )
                         player_matches_cache[puuid] = match_ids
                         await asyncio.sleep(0.5)  # Rate limit
@@ -213,7 +224,7 @@ class LPTrackerBot(commands.Bot):
                     print(f"Error checking matches for {player['riot_id']}: {e}")
 
         # Periodic cleanup of old match records
-        await db.cleanup_old_notified_matches(days=7)
+        await db.cleanup_old_notified_matches(days=NOTIFIED_MATCH_RETENTION_DAYS)
 
     @check_match_notifications.before_loop
     async def before_match_check(self):
