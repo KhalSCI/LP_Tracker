@@ -14,7 +14,7 @@ from champions import champions
 from config import TIMEZONE
 from scouting import (
     parse_players, season_of, parse_pro_meta, champion_key, summarize, ban_suggestions, recent_months,
-    build_sheet_rows, scout_rows, parse_opponent_rows, SHEET_COLS, MONTH_SECONDS,
+    build_sheet_rows, scout_rows, parse_opponent_rows, ranked_policy, SHEET_COLS, MONTH_SECONDS,
 )
 
 YEAR = 2026
@@ -105,6 +105,25 @@ class TestSummarize:
         longer = summarize(history, NOW, 12, {})
         assert [c["champion"] for c in longer["ranked"]] == ["Camille", "Aatrox", "Jax"]
 
+    def test_flex_is_left_out(self):
+        s = summarize(games("Camille", 3, 0) + games("Jax", 5, 0, queue=440), NOW, 6, {})
+        assert [c["champion"] for c in s["ranked"]] == ["Camille"] and s["tournament"] == []
+        assert s["ranked_label"] == "SoloQ" and s["ranked_skipped"] is None
+
+    def test_ranked_policy(self):
+        assert ranked_policy("euw1", None)["queues"] == {420}
+        assert ranked_policy("eun1", {"tier": "MASTER"})["queues"] == {420}
+        assert ranked_policy("eun1", {"tier": "CHALLENGER"})["skipped"] is None
+        diamond = ranked_policy("eun1", {"tier": "DIAMOND"})
+        assert diamond["queues"] == set() and diamond["skipped"] == "nie liczę, konto EUNE poniżej Mastera"
+        assert ranked_policy("eun1", None)["queues"] == set()
+
+    def test_eune_below_master_counts_only_tournaments(self):
+        policy = ranked_policy("eun1", {"tier": "DIAMOND"})
+        s = summarize(games("Camille", 8, 2) + games("Gnar", 2, 0, queue=3130), NOW, 6, {}, policy)
+        assert s["ranked"] == [] and s["recent"] == [] and [c["champion"] for c in s["tournament"]] == ["Gnar"]
+        assert s["ranked_skipped"] == "nie liczę, konto EUNE poniżej Mastera"
+
     def test_recent_months(self):
         assert [recent_months(m) for m in (3, 6, 12)] == [1, 3, 3]
 
@@ -121,8 +140,9 @@ class TestSummarize:
         bans = ban_suggestions([top, mid, error])
 
         assert [b["champion"] for b in bans] == ["Camille", "Azir", "Ahri"]
-        assert bans[0]["reason"] == "10 gier, 80% WR w 6 mies." and bans[0]["player"] == "Top"
-        assert bans[1]["reason"] == "3 w turniejach (67% WR)"
+        assert bans[0]["reason"] == "SoloQ: 10 gier, 80% WR" and bans[0]["player"] == "Top"
+        assert bans[1]["reason"] == "turnieje: 3 gry, 67% WR"
+        assert (bans[1]["ranked_games"], bans[1]["tourney_games"], bans[1]["tourney_wr"]) == (0, 3, 2 / 3)
 
 
 def empty_history() -> dict:
@@ -144,14 +164,29 @@ class TestSheetRows:
 
         assert all(len(row) == SHEET_COLS for row in rows)
         assert rows[0][0] == "Scouting: AGH" and "z ostatnich 6 mies." in rows[1][0]
-        assert ["Camille", "Top", "Top", "10 gier, 80% WR w 6 mies.", "", ""] == rows[5][:6]
-        titles = next(row for row in rows if row[0].startswith("Ranked, ostatnie"))
+        assert ["Camille", "Top", "Top", "SoloQ", 10, "80%", 0, "", "", ""] == rows[5][:10]
+        titles = next(row for row in rows if row[0].startswith("SoloQ, ostatnie"))
         assert [titles[0], titles[9], titles[18]] == [
-            "Ranked, ostatnie 6 mies. (10 gier)", "Ranked, ostatnie 3 mies. (10 gier)", "Turnieje, ostatnie 6 mies. (1 gra)"]
+            "SoloQ, ostatnie 6 mies. (10 gier)", "SoloQ, ostatnie 3 mies. (10 gier)",
+            "Turnieje (kody turniejowe), ostatnie 6 mies. (1 gra)"]
         header = next(i for i, row in enumerate(rows) if row[0] == "Champion" and row[9] == "Champion")
         assert rows[header + 1][:6] == ["Camille", 10, 8, 2, "80%", 5.0]
         assert rows[header + 1][18:20] == ["Gnar", 1]
         assert ["X#1", "⚠ Nie znaleziono konta"] == rows[-1][:2]
+
+    def test_skipped_soloq(self):
+        policy = ranked_policy("eun1", None)
+        player = {"riot_id": "Smurf#EUNE", "platform": "eun1", "ranks": {},
+                  "summary": summarize(games("Camille", 8, 2), NOW, 6, {}, policy)}
+        report = {"team": "AGH", "year": YEAR, "months": 6, "created": datetime(2026, 10, 30, 16, 0, tzinfo=TIMEZONE),
+                  "players": [player], "bans": [], "summary": None, "pro_meta": {}, "history": empty_history()}
+
+        titles = next(row for row in build_sheet_rows(report) if row[18].startswith("Turnieje"))
+        embed = scouting.build_embed(report)
+
+        assert titles[0] == "SoloQ: nie liczę, konto EUNE poniżej Mastera" and titles[9] == ""
+        assert "**SoloQ:** nie liczę, konto EUNE poniżej Mastera" in embed.fields[0].value
+        assert "**Turnieje, 6 mies.:** brak gier" in embed.fields[0].value
 
 
 class TestEmbed:
@@ -171,7 +206,8 @@ class TestEmbed:
     def test_five_accounts_get_four_champions(self):
         embed = scouting.build_embed(self.report(5))
         assert embed.fields[0].value.count("(") == 4 * 3
-        assert "**6 mies.:**" in embed.fields[0].value and "**3 mies.:**" in embed.fields[0].value
+        assert "**SoloQ, 6 mies.:**" in embed.fields[0].value and "**SoloQ, 3 mies.:**" in embed.fields[0].value
+        assert "**Turnieje, 6 mies.:**" in embed.fields[0].value
 
     def test_ten_accounts_fit(self):
         embed = scouting.build_embed(self.report(10, summary="• " + "banujcie Camille " * 200))
@@ -185,9 +221,9 @@ class FakeRiot:
     def __init__(self, matches: dict[str, dict], ids: dict[tuple, list[str]]):
         self.matches, self.ids, self.details_calls, self.id_calls = matches, ids, [], []
 
-    async def get_match_ids(self, puuid, match_type=None, start_time=None, start=0, count=100):
-        self.id_calls.append((puuid, match_type, start_time, start))
-        return self.ids.get((puuid, match_type), [])[start:start + count]
+    async def get_match_ids(self, puuid, match_type=None, start_time=None, start=0, count=100, queue=None):
+        self.id_calls.append((puuid, match_type or queue, start_time, start))
+        return self.ids.get((puuid, match_type or queue), [])[start:start + count]
 
     async def get_match_details(self, match_id):
         self.details_calls.append(match_id)
@@ -220,8 +256,8 @@ class TestFetching:
             "EUW1_2": payload("EUW1_2", {"a": "Jax"}),
             "EUW1_3": payload("EUW1_3", {"b": "Azir"}, queue=3130),
         }
-        fake = FakeRiot(matches, {("a", "ranked"): ["EUW1_1", "EUW1_2"], ("b", "ranked"): ["EUW1_1"],
-                                  ("b", "tourney"): ["EUW1_3"]})
+        fake = FakeRiot(matches, {("a", 420): ["EUW1_1", "EUW1_2"], ("b", 420): ["EUW1_1"],
+                                  ("b", "tourney"): ["EUW1_3"], ("c", 420): ["EUW1_9"], ("c", "tourney"): ["EUW1_3"]})
         monkeypatch.setattr(scouting.riot_api, "get_match_ids", fake.get_match_ids)
         monkeypatch.setattr(scouting.riot_api, "get_match_details", fake.get_match_details)
         return fake
@@ -230,22 +266,24 @@ class TestFetching:
         await db.init_db()
         since = NOW - 6 * MONTH_SECONDS
 
-        assert await scouting.new_match_ids("a", since) == ["EUW1_1", "EUW1_2"]
+        assert await scouting.new_match_ids("a", since, {420}) == ["EUW1_1", "EUW1_2"]
         await scouting.store_scout_games(["EUW1_1", "EUW1_2"], {"a", "b"})
-        assert await scouting.new_match_ids("b", since) == ["EUW1_3"]
+        assert await scouting.new_match_ids("b", since, {420}) == ["EUW1_3"]
         await scouting.store_scout_games(["EUW1_3"], {"a", "b"})
-        assert await scouting.new_match_ids("a", since) == []
+        assert await scouting.new_match_ids("a", since, {420}) == []
+        # An EUNE account below Master: only tournament-code games are listed
+        assert await scouting.new_match_ids("c", since, set()) == ["EUW1_3"]
 
         assert fake.details_calls == ["EUW1_1", "EUW1_2", "EUW1_3"]
-        assert ("a", "ranked", since, 0) in fake.id_calls
+        assert ("a", 420, since, 0) in fake.id_calls
         b_games = await db.get_scout_games("b")
         assert {(g["champion"], g["queue_id"]) for g in b_games} == {("Ahri", 420), ("Azir", 3130)}
 
     async def test_paging_has_no_game_limit(self, monkeypatch):
-        fake = FakeRiot({}, {("a", "ranked"): [f"EUW1_{i}" for i in range(250)]})
+        fake = FakeRiot({}, {("a", 420): [f"EUW1_{i}" for i in range(250)]})
         monkeypatch.setattr(scouting.riot_api, "get_match_ids", fake.get_match_ids)
 
-        assert len(await scouting.fetch_match_ids("a", "ranked", NOW)) == 250
+        assert len(await scouting.fetch_match_ids("a", NOW, queue=420)) == 250
         assert [call[3] for call in fake.id_calls] == [0, 100, 200]
 
     async def test_run_reports_games_to_fetch(self, monkeypatch, fake):

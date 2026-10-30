@@ -1,6 +1,7 @@
 """
 Opponent scouting for draft prep: each account's champions in ranked and tournament-code
-games of the last months (games, winrate, KDA), from the Riot API (EUW and EUNE accounts),
+games of the last months (games, winrate, KDA), from the Riot API: SoloQ of EUW accounts
+(on other servers like EUNE only from Master up) and tournament-code games, kept apart,
 with pro-play priority from gol.gg, suggested bans and what they played against us.
 Opponents' accounts come from the "Przeciwnicy" tab (multi op.gg links per team).
 Posted to Discord and written to the bot-only "Scouting" tab.
@@ -20,7 +21,7 @@ import gspread
 import database as db
 import llm
 from champions import champions
-from cogs.sheet import format_tier
+from cogs.sheet import format_tier, APEX_TIERS, SOLOQ_QUEUE
 from config import TIMEZONE, SCOUT_MONTHS, GOOGLE_SHEET_ID
 from riot_api import riot_api, RiotAPIError
 from roasts import plural, games_count
@@ -32,7 +33,10 @@ OPPONENTS_TAB = "Przeciwnicy"
 OPPONENTS_HEADERS = ["Drużyna", "Multi EUW", "Multi EUNE", "Notatki"]
 OPPONENTS_FIRST_ROW = 5
 OPPONENTS_CACHE_SECONDS = 300
+# Flex isn't scouted; this keeps Flex games stored earlier out of the tournament ones
 RANKED_QUEUES = {420: "SoloQ", 440: "Flex"}
+# SoloQ counts on this server; on others (EUNE) it's often a smurf's, so only from Master up
+MAIN_PLATFORM = "euw1"
 # Clash isn't scouted (match-v5's "tourney" type leaves it out anyway)
 CLASH_QUEUE = 700
 SUMMONERS_RIFT = 11
@@ -73,6 +77,7 @@ SHEET_COLS = 26
 SUMMARY_PROMPT = """Jesteś analitykiem draftu w uczelnianej drużynie League of Legends.
 Dostajesz dane o drużynie przeciwnika: pule championów graczy z rankedów z ostatnich miesięcy, gry turniejowe, sugerowane bany i priorytet championów w grze profesjonalnej.
 Napisz po polsku 3-5 krótkich punktów do przygotowania draftu: co banować, na kim się skupić, comfort picki i one-tricki, na co uważać.
+Wyraźnie rozróżniaj gry z SoloQ i turniejowe (kody turniejowe): turniejowe lepiej pokazują, co grają w meczach drużynowych.
 Opieraj się wyłącznie na podanych danych, nie wymyślaj. Każdy punkt w osobnej linii zaczynającej się od "• ", razem najwyżej 700 znaków."""
 
 _scout_lock = asyncio.Lock()
@@ -257,20 +262,39 @@ def scout_rows(match_id: str, match_data: dict, puuids: set[str]) -> list[dict]:
     return rows
 
 
-async def fetch_match_ids(puuid: str, match_type: str, start_time: int) -> list[str]:
-    """All match IDs of one type since start_time (Unix seconds), newest first."""
+def ranked_policy(platform: str, solo: dict | None) -> dict:
+    """
+    Which ranked games count for an account: {"queues", "label", "skipped"}. SoloQ on EUW;
+    on other servers SoloQ only from Master up, otherwise none (skipped says why).
+    """
+    if platform == MAIN_PLATFORM or (solo and (solo.get("tier") or "").upper() in APEX_TIERS):
+        return {"queues": {SOLOQ_QUEUE}, "label": "SoloQ", "skipped": None}
+    server = PLATFORM_NAMES.get(platform, platform.upper())
+    return {"queues": set(), "label": "SoloQ", "skipped": f"nie liczę, konto {server} poniżej Mastera"}
+
+
+EUW_POLICY = ranked_policy(MAIN_PLATFORM, None)
+
+
+async def fetch_match_ids(puuid: str, start_time: int, match_type: str = None, queue: int = None) -> list[str]:
+    """All match IDs of one type or queue since start_time (Unix seconds), newest first."""
     ids = []
     while True:
-        page = await riot_api.get_match_ids(puuid, match_type=match_type, start_time=start_time, start=len(ids), count=IDS_PAGE)
+        page = await riot_api.get_match_ids(
+            puuid, match_type=match_type, start_time=start_time, start=len(ids), count=IDS_PAGE, queue=queue
+        )
         ids += page
         if len(page) < IDS_PAGE:
             return ids
 
 
-async def new_match_ids(puuid: str, since: int) -> list[str]:
-    """An account's ranked and tournament-code games since a Unix time that aren't stored yet."""
+async def new_match_ids(puuid: str, since: int, ranked_queues: set[int]) -> list[str]:
+    """An account's games in ranked_queues and tournament-code games since a Unix time that aren't stored yet."""
     known = await db.get_scout_match_ids(puuid)
-    ids = await fetch_match_ids(puuid, "ranked", since) + await fetch_match_ids(puuid, "tourney", since)
+    ids = []
+    for queue in sorted(ranked_queues):
+        ids += await fetch_match_ids(puuid, since, queue=queue)
+    ids += await fetch_match_ids(puuid, since, match_type="tourney")
     return [match_id for match_id in dict.fromkeys(ids) if match_id not in known]
 
 
@@ -316,15 +340,16 @@ def recent_months(months: int) -> int:
     return RECENT_MONTHS if months > RECENT_MONTHS else 1
 
 
-def summarize(games: list[dict], now: int, months: int, pro_meta: dict) -> dict:
+def summarize(games: list[dict], now: int, months: int, pro_meta: dict, policy: dict = EUW_POLICY) -> dict:
     """
-    An account's champions in ranked over the last months and the most recent ones,
-    in tournament-code games, its main role and a one-trick warning. now is Unix seconds.
+    An account's champions in ranked (the queues its policy allows) over the last months and
+    the most recent ones, in tournament-code games, its main role and a one-trick warning.
+    now is Unix seconds.
     """
     since_ms = (now - months * MONTH_SECONDS) * 1000
     recent_since_ms = (now - recent_months(months) * MONTH_SECONDS) * 1000
     counted = [g for g in games if g["win"] is not None and g["season"] and g["game_start"] >= since_ms]
-    ranked = [g for g in counted if g["queue_id"] in RANKED_QUEUES]
+    ranked = [g for g in counted if g["queue_id"] in policy["queues"]]
     recent = [g for g in ranked if g["game_start"] >= recent_since_ms]
     tournament = [g for g in counted if g["queue_id"] not in RANKED_QUEUES and g["queue_id"] != CLASH_QUEUE]
 
@@ -337,6 +362,8 @@ def summarize(games: list[dict], now: int, months: int, pro_meta: dict) -> dict:
     return {
         "months": months,
         "recent_months": recent_months(months),
+        "ranked_label": policy["label"],
+        "ranked_skipped": policy["skipped"],
         "ranked": ranked_table,
         "recent": champion_table(recent, pro_meta),
         "tournament": champion_table(tournament, pro_meta),
@@ -387,15 +414,20 @@ def ban_suggestions(players: list[dict]) -> list[dict]:
             wins = (r["wins"] if r else 0) + TOURNEY_WEIGHT * (t["wins"] if t else 0)
             reasons = []
             if r:
-                reasons.append(f"{games_count(r['games'])}, {pct(r['wr'])} WR w {summary['months']} mies.")
+                reasons.append(f"{summary['ranked_label']}: {games_count(r['games'])}, {pct(r['wr'])} WR")
             if t:
-                reasons.append(f"{t['games']} w turniejach ({pct(t['wr'])} WR)")
+                reasons.append(f"turnieje: {games_count(t['games'])}, {pct(t['wr'])} WR")
             candidates.append({
                 "champion": champion,
                 "player": player_name(player),
                 "role": player["summary"]["role"],
                 "score": games * (wins + 1) / (games + 2),
-                "reason": ", ".join(reasons),
+                "reason": " · ".join(reasons),
+                "ranked_label": summary["ranked_label"],
+                "ranked_games": r["games"] if r else 0,
+                "ranked_wr": r["wr"] if r else None,
+                "tourney_games": t["games"] if t else 0,
+                "tourney_wr": t["wr"] if t else None,
                 "pro_prio": (r or t)["pro_prio"],
                 "pro_wr": (r or t)["pro_wr"],
             })
@@ -565,11 +597,15 @@ def summary_facts(report: dict) -> str:
         if player.get("error"):
             continue
         s = player["summary"]
+        if s["ranked_skipped"]:
+            ranked = f"{s['ranked_label']}: {s['ranked_skipped']}"
+        else:
+            ranked = (f"{s['ranked_label']} w ostatnich {s['months']} mies.: {pool_text(s['ranked'], 5)}; "
+                      f"{s['ranked_label']} w ostatnich {s['recent_months']} mies.: {pool_text(s['recent'], 3)}")
         lines.append(
-            f"{s['role'] or '?'} {player_name(player)} ({rank_text(player['ranks'].get('solo'))}): "
-            f"ranked w ostatnich {s['months']} mies.: {pool_text(s['ranked'], 5)}; "
-            f"w ostatnich {s['recent_months']} mies.: {pool_text(s['recent'], 3)}; "
-            f"turnieje: {pool_text(s['tournament'], 3)}"
+            f"{s['role'] or '?'} {player_name(player)} ({PLATFORM_NAMES.get(player['platform'], player['platform'])}, "
+            f"{rank_text(player['ranks'].get('solo'))}): {ranked}; "
+            f"turnieje (kody turniejowe) w ostatnich {s['months']} mies.: {pool_text(s['tournament'], 5)}"
             + (f"; one-trick {s['one_trick']['champion']} ({pct(s['one_trick']['share'])} gier)" if s["one_trick"] else "")
         )
     if report["bans"]:
@@ -602,21 +638,24 @@ async def run_scouting(team_name: str, riot_ids: list[str], months: int = SCOUT_
 
         players = [await lookup_account(riot_id) for riot_id in riot_ids]
         accounts = [p for p in players if not p.get("error")]
-        to_fetch = {}
-        for player in accounts:
-            to_fetch.update(dict.fromkeys(await new_match_ids(player["puuid"], since)))
-        if progress:
-            await progress(len(to_fetch))
-        await store_scout_games(list(to_fetch), {p["puuid"] for p in accounts})
-
         for player in accounts:
             try:
                 player["ranks"] = ranked_entries(await riot_api.get_league_entries(player["puuid"], player["platform"]))
             except RiotAPIError as e:
                 print(f"Scouting: no ranks for {player['riot_id']}: {e}")
                 player["ranks"] = {}
+            player["policy"] = ranked_policy(player["platform"], player["ranks"].get("solo"))
+
+        to_fetch = {}
+        for player in accounts:
+            to_fetch.update(dict.fromkeys(await new_match_ids(player["puuid"], since, player["policy"]["queues"])))
+        if progress:
+            await progress(len(to_fetch))
+        await store_scout_games(list(to_fetch), {p["puuid"] for p in accounts})
+
+        for player in accounts:
             games = await db.get_scout_games(player["puuid"], since * 1000)
-            player["summary"] = summarize(games, int(now.timestamp()), months, pro_meta)
+            player["summary"] = summarize(games, int(now.timestamp()), months, pro_meta, player["policy"])
 
         role_order = {role: i for i, role in enumerate(ROLES)}
         players.sort(key=lambda p: role_order.get((p.get("summary") or {}).get("role"), len(ROLES)))
@@ -670,13 +709,15 @@ def embed_with(report: dict, count: int) -> discord.Embed:
             continue
         s = player["summary"]
         name = f"{s['role'] or '?'} · {player['riot_id']} · {PLATFORM_NAMES.get(player['platform'], player['platform'].upper())}"
-        lines = [
-            rank_text(player["ranks"].get("solo")),
-            f"**{s['months']} mies.:** {champion_line(s['ranked'], count)}",
-            f"**{s['recent_months']} mies.:** {champion_line(s['recent'], count)}",
-        ]
-        if s["tournament"]:
-            lines.append(f"**Turnieje:** {champion_line(s['tournament'], count)}")
+        lines = [rank_text(player["ranks"].get("solo"))]
+        if s["ranked_skipped"]:
+            lines.append(f"**{s['ranked_label']}:** {s['ranked_skipped']}")
+        else:
+            lines += [
+                f"**{s['ranked_label']}, {s['months']} mies.:** {champion_line(s['ranked'], count)}",
+                f"**{s['ranked_label']}, {s['recent_months']} mies.:** {champion_line(s['recent'], count)}",
+            ]
+        lines.append(f"**Turnieje, {s['months']} mies.:** {champion_line(s['tournament'], count)}")
         if s["one_trick"]:
             lines.append(f"⚠ One-trick: {s['one_trick']['champion']} ({pct(s['one_trick']['share'])} gier w {s['months']} mies.)")
         embed.add_field(name=name[:256], value="\n".join(lines)[:1024], inline=False)
@@ -684,7 +725,7 @@ def embed_with(report: dict, count: int) -> discord.Embed:
     if report["bans"]:
         embed.add_field(
             name="🚫 Sugerowane bany",
-            value="\n".join(f"**{b['champion']}** ({b['player']}): {b['reason']}" for b in report["bans"])[:1024],
+            value="\n".join(f"**{b['champion']}** ({b['player']}) {b['reason']}" for b in report["bans"])[:1024],
             inline=False,
         )
     history = report["history"]
@@ -725,14 +766,18 @@ def build_sheet_rows(report: dict) -> list[list]:
 
     add((0, [f"Scouting: {report['team']}"]))
     add((0, [
-        f"Wygenerowano {report['created']:%d.%m.%Y %H:%M} · wszystkie gry rankingowe (SoloQ i Flex) "
-        f"i z kodów turniejowych z ostatnich {report['months']} mies. · pro: gol.gg S{year - SEASON_OFFSET}, wszystkie turnieje"
+        f"Wygenerowano {report['created']:%d.%m.%Y %H:%M} · gry z ostatnich {report['months']} mies.: SoloQ "
+        f"(konta spoza EUW tylko od Mastera) i osobno gry z kodów turniejowych · "
+        f"pro: gol.gg S{year - SEASON_OFFSET}, wszystkie turnieje"
     ]))
     add()
     add((0, ["Sugerowane bany"]))
-    add((0, ["Champion", "Gracz", "Rola", "Dlaczego", "Pro prio", "Pro WR"]))
+    add((0, ["Champion", "Gracz", "Rola", "Ranked", "Ranked gry", "Ranked WR", "Turnieje gry", "Turnieje WR", "Pro prio", "Pro WR"]))
     for ban in report["bans"]:
-        add((0, [ban["champion"], ban["player"], ban["role"], ban["reason"], pct(ban["pro_prio"]), pct(ban["pro_wr"])]))
+        add((0, [
+            ban["champion"], ban["player"], ban["role"], ban["ranked_label"], ban["ranked_games"], pct(ban["ranked_wr"]),
+            ban["tourney_games"], pct(ban["tourney_wr"]), pct(ban["pro_prio"]), pct(ban["pro_wr"]),
+        ]))
     if report["summary"]:
         add()
         add((0, ["Podsumowanie"]))
@@ -756,13 +801,17 @@ def build_sheet_rows(report: dict) -> list[list]:
             f"{s['role'] or '?'} · {player['riot_id']}",
             PLATFORM_NAMES.get(player["platform"], player["platform"].upper()),
             f"SoloQ: {rank_text(player['ranks'].get('solo'))}",
-            f"Flex: {rank_text(player['ranks'].get('flex'))}",
             f"One-trick: {s['one_trick']['champion']} ({pct(s['one_trick']['share'])} gier)" if s["one_trick"] else "",
         ]))
-        titles = [
-            f"Ranked, ostatnie {s['months']} mies. ({games_count(s['ranked_games'])})",
-            f"Ranked, ostatnie {s['recent_months']} mies. ({games_count(s['recent_games'])})",
-            f"Turnieje, ostatnie {s['months']} mies. ({games_count(s['tournament_games'])})",
+        if s["ranked_skipped"]:
+            ranked_titles = [f"{s['ranked_label']}: {s['ranked_skipped']}", ""]
+        else:
+            ranked_titles = [
+                f"{s['ranked_label']}, ostatnie {s['months']} mies. ({games_count(s['ranked_games'])})",
+                f"{s['ranked_label']}, ostatnie {s['recent_months']} mies. ({games_count(s['recent_games'])})",
+            ]
+        titles = ranked_titles + [
+            f"Turnieje (kody turniejowe), ostatnie {s['months']} mies. ({games_count(s['tournament_games'])})",
         ]
         add(*[(column, [title]) for column, title in zip(BLOCK_COLUMNS, titles)])
         add(*[(column, BLOCK_HEADERS) for column in BLOCK_COLUMNS])
