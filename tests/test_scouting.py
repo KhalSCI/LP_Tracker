@@ -46,6 +46,11 @@ class TestParsePlayers:
         link = "https://op.gg/lol/multisearch/euw?summoners=iym%230509%2CRychu+Peja%23SLUG%2CKiziu%23Gwali"
         assert parse_players(link) == ["iym#0509", "Rychu Peja#SLUG", "Kiziu#Gwali"]
 
+    def test_euw_and_eune_links(self):
+        text = ("https://op.gg/lol/multisearch/euw?summoners=Top%23EUW%2CMid%23EUW "
+                "https://op.gg/lol/multisearch/eune?summoners=TopSmurf%23EUNE%2CMid%23EUW")
+        assert parse_players(text) == ["Top#EUW", "Mid#EUW", "TopSmurf#EUNE"]
+
     def test_profile_links_and_list(self):
         text = ("https://op.gg/lol/summoners/eune/Some%20Name-EUNE\n"
                 "Rychu Peja#SLUG, alive n HAPPY33#frk; rychu peja#slug")
@@ -107,7 +112,7 @@ class TestSummarize:
 
         assert [b["champion"] for b in bans] == ["Camille", "Azir", "Ahri"]
         assert bans[0]["reason"] == "10 gier, 80% WR w tym sezonie" and bans[0]["player"] == "Top"
-        assert bans[1]["reason"] == "3 w turniejach (67% WR)"
+        assert bans[1]["reason"] == "3 w turniejach/Clashu (67% WR)"
 
 
 class TestSheetRows:
@@ -132,14 +137,38 @@ class TestSheetRows:
         assert ["X#1", "⚠ Nie znaleziono konta"] == rows[-1][:2]
 
 
+class TestEmbed:
+    """Test cases for build_embed."""
+
+    def report(self, accounts: int, summary: str = None) -> dict:
+        champs = ["Camille", "Jax", "Aatrox", "Gnar", "Fiora", "Renekton", "Ksante", "Rumble"]
+        history = [g for i, c in enumerate(champs) for g in games(c, 5 + i, 3)]
+        history += [g for c in champs for g in games(c, 2, 2, season=YEAR - 1)]
+        history += [g for c in champs for g in games(c, 1, 1, queue=3130)]
+        players = [{"riot_id": f"Very Long Player Name {i}#EUNE", "platform": "eun1", "ranks": {},
+                    "summary": summarize(history, YEAR, {})} for i in range(accounts)]
+        return {"team": "AGH", "year": YEAR, "created": datetime(2026, 10, 30, 16, 0, tzinfo=TIMEZONE),
+                "players": players, "bans": ban_suggestions(players), "summary": summary, "pro_meta": {},
+                "history": {"games": 0, "wins": 0, "players": Counter(), "picks": Counter(), "bans": Counter()}}
+
+    def test_five_accounts_get_four_champions(self):
+        embed = scouting.build_embed(self.report(5))
+        assert embed.fields[0].value.count("(") == 4 * 3
+
+    def test_ten_accounts_fit(self):
+        embed = scouting.build_embed(self.report(10, summary="• " + "banujcie Camille " * 200))
+        assert len(embed) <= scouting.EMBED_MAX_LENGTH
+        assert len(embed.fields) == 11
+
+
 class FakeRiot:
     """Match IDs per (puuid, type, window) and match payloads."""
 
     def __init__(self, matches: dict[str, dict], ids: dict[tuple, list[str]]):
         self.matches, self.ids, self.details_calls = matches, ids, []
 
-    async def get_match_ids(self, puuid, match_type=None, start_time=None, end_time=None, start=0, count=100):
-        return self.ids.get((puuid, match_type, end_time is None), [])[start:start + count]
+    async def get_match_ids(self, puuid, match_type=None, start_time=None, end_time=None, start=0, count=100, queue=None):
+        return self.ids.get((puuid, match_type or queue, end_time is None), [])[start:start + count]
 
     async def get_match_details(self, match_id):
         self.details_calls.append(match_id)
@@ -169,20 +198,25 @@ class TestSync:
         matches = {
             "EUW1_1": payload("EUW1_1", {"a": "Camille", "b": "Ahri"}),
             "EUW1_2": payload("EUW1_2", {"a": "Jax"}, version="15.20.1.1"),
-            "EUW1_3": payload("EUW1_3", {"b": "Azir"}, queue=0),
+            "EUW1_3": payload("EUW1_3", {"b": "Azir"}, queue=3130),
+            "EUN1_4": payload("EUN1_4", {"b": "Orianna"}, queue=700),
         }
         fake = FakeRiot(matches, {("a", "ranked", True): ["EUW1_1"], ("a", "ranked", False): ["EUW1_2"],
-                                  ("b", "ranked", True): ["EUW1_1"], ("b", "tourney", True): ["EUW1_3"]})
+                                  ("b", "ranked", True): ["EUW1_1"], ("b", "tourney", True): ["EUW1_3"],
+                                  ("b", 700, True): ["EUN1_4"]})
         monkeypatch.setattr(scouting.riot_api, "get_match_ids", fake.get_match_ids)
         monkeypatch.setattr(scouting.riot_api, "get_match_details", fake.get_match_details)
 
         assert await scouting.sync_scout_games("a", {"a", "b"}, YEAR) == 2
-        assert await scouting.sync_scout_games("b", {"a", "b"}, YEAR) == 1
+        assert await scouting.sync_scout_games("b", {"a", "b"}, YEAR) == 2
         assert await scouting.sync_scout_games("a", {"a", "b"}, YEAR) == 0
 
-        assert fake.details_calls == ["EUW1_1", "EUW1_2", "EUW1_3"]
+        assert fake.details_calls == ["EUW1_1", "EUW1_2", "EUW1_3", "EUN1_4"]
         b_games = await db.get_scout_games("b")
-        assert {(g["champion"], g["season"], g["queue_id"]) for g in b_games} == {("Ahri", 2026, 420), ("Azir", 2026, 0)}
+        assert {(g["champion"], g["season"], g["queue_id"]) for g in b_games} == {
+            ("Ahri", 2026, 420), ("Azir", 2026, 3130), ("Orianna", 2026, 700)}
+        summary = summarize(b_games, YEAR, {})
+        assert [c["champion"] for c in summary["tournament"]] == ["Azir", "Orianna"]
 
     def test_remake_row(self):
         data = payload("EUW1_9", {"a": "Camille"})

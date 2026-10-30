@@ -201,15 +201,19 @@ class RiotAPI:
         start_time: int = None,
         end_time: int = None,
         start: int = 0,
-        count: int = 100
+        count: int = 100,
+        queue: int = None
     ) -> list[str]:
         """
         Get a page of a player's match IDs, newest first, optionally only one type
-        ("ranked", "tourney", ...) and only between start_time and end_time (Unix seconds).
+        ("ranked", "tourney" = tournament codes, ...) or queue (e.g. 700 = Clash, which
+        "tourney" doesn't include) and only between start_time and end_time (Unix seconds).
         """
         url = f"{RIOT_ACCOUNT_API}/lol/match/v5/matches/by-puuid/{puuid}/ids?count={count}&start={start}"
         if match_type:
             url += f"&type={match_type}"
+        if queue:
+            url += f"&queue={queue}"
         if start_time:
             url += f"&startTime={start_time}"
         if end_time:

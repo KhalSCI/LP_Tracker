@@ -1,4 +1,4 @@
-"""Pings for Main players who haven't filled in the "Dostępność" tab for the next days."""
+"""Pings for Main players who left the "Dostępność" tab empty for the next days."""
 from datetime import date, datetime, timedelta
 
 from config import AVAILABILITY_DAYS
@@ -10,8 +10,8 @@ AVAILABILITY_TAB = "Dostępność"
 HEADER_ROW = 5
 DATE_HEADER = "Data"
 MAIN_STATUS = "main"
-# "nie" (can't play) is an answer; "?" (don't know yet) isn't
-NO_ANSWER = {"", "?"}
+# Any text is an answer, also "nie" (can't play) and "?" (don't know yet); only an empty cell isn't
+NO_ANSWER = {""}
 
 
 def parse_day(value) -> date | None:
@@ -31,7 +31,7 @@ def days_to_check(today: date, days: int) -> list[date]:
 
 def missing_availability(rows: list[list], nicks: list[str], days: list[date]) -> dict[str, list[date]]:
     """
-    Which of the days each nick left without an answer (empty or "?"), from raw
+    Which of the days each nick left empty, from raw
     "Dostępność" rows (header row first). Nicks without missing days are left out.
     Nicks without a column and days without a row are skipped and logged.
     """
@@ -79,7 +79,7 @@ def format_day(day: date) -> str:
 
 def create_availability_message(missing: list[tuple[str, list[date]]], tab_url: str) -> str:
     """The reminder, one line per player as (mention, missing days)."""
-    lines = ["📅 Uzupełnijcie dostępność na najbliższe dni (godziny albo „nie”, „?” się nie liczy):"]
+    lines = ["📅 Uzupełnijcie dostępność na najbliższe dni (godziny, „nie” albo „?”):"]
     for who, days in missing:
         lines.append(f"• {who}: {', '.join(format_day(day) for day in days)}")
     lines.append(f"Zakładka Dostępność: <{tab_url}>")

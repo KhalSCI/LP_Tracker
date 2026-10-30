@@ -23,7 +23,7 @@ class ScoutingCog(commands.Cog):
     @app_commands.command(name="scout", description="Scouting przeciwnika: pule championów z tego i poprzedniego sezonu, bany")
     @app_commands.describe(
         druzyna="Nazwa drużyny (jak w kolumnie Przeciwnik w zakładce Mecze)",
-        gracze="Link multi op.gg albo Riot ID po przecinku; zapamiętam je dla tej drużyny",
+        gracze="Linki multi op.gg (np. EUW i EUNE, oddzielone spacją) albo Riot ID po przecinku; zapamiętam je",
     )
     @app_commands.autocomplete(druzyna=team_autocomplete)
     async def scout(self, interaction: discord.Interaction, druzyna: str, gracze: str = None):
@@ -33,7 +33,7 @@ class ScoutingCog(commands.Cog):
         if gracze:
             players = scouting.parse_players(gracze)
             if not players:
-                await interaction.followup.send("❌ Nie widzę tu Riot ID. Podaj link multi op.gg albo np. `Nick#EUW, Nick2#EUNE`.")
+                await interaction.followup.send("❌ Nie widzę tu Riot ID. Podaj link(i) multi op.gg albo np. `Nick#EUW, Nick2#EUNE`.")
                 return
             await db.save_opponent(druzyna, players)
         else:
@@ -47,9 +47,10 @@ class ScoutingCog(commands.Cog):
 
         queued = " Czekam w kolejce na poprzedni scouting." if scouting.is_running() else ""
         await interaction.followup.send(
-            f"🔎 Scouting **{discord.utils.escape_markdown(druzyna)}** ({len(players)} graczy: "
+            f"🔎 Scouting **{discord.utils.escape_markdown(druzyna)}** ({len(players)} kont: "
             f"{discord.utils.escape_markdown(', '.join(players))}).{queued} "
-            "Za pierwszym razem może to potrwać kilkanaście minut (limit Riot API), raport wrzucę tutaj."
+            "Za pierwszym razem może to potrwać kilkanaście minut, przy kontach z dwóch serwerów nawet pół godziny "
+            "(limit Riot API). Raport wrzucę tutaj."
         )
         scouting.start_scouting(interaction.channel, druzyna, players)
 

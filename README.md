@@ -80,7 +80,7 @@ The role is pinged only if it is mentionable or the bot has the "Mention @everyo
 
 #### Availability pings
 
-Once a day from `AVAILABILITY_HOUR` (default 12:00) the bot checks the `Dostępność` tab for the next `AVAILABILITY_DAYS` days (default 3, from tomorrow). Players with status `Main` in `Skład` whose cell for one of those days is empty or `?` get one message on the reminders channel that pings them and lists the days; `nie` counts as an answer. Nicks are matched to Discord members by name (cached in the database), so no privileged intent is needed. `/sheet availability` shows who would be pinged right now, without pinging.
+Once a day from `AVAILABILITY_HOUR` (default 12:00) the bot checks the `Dostępność` tab for the next `AVAILABILITY_DAYS` days (default 3, from tomorrow). Players with status `Main` in `Skład` whose cell for one of those days is empty get one message on the reminders channel that pings them and lists the days; any text counts as an answer, also `nie` and `?`. Nicks are matched to Discord members by name (cached in the database), so no privileged intent is needed. `/sheet availability` shows who would be pinged right now, without pinging.
 
 #### Scrims, officials and drafts
 
@@ -94,11 +94,11 @@ The Riot API doesn't return regular custom games, so scrims come from the LoL cl
 
 #### Opponent scouting
 
-`/scout <team> [players]` scouts an opponent for draft prep. Players are given as a multi op.gg link or Riot IDs separated by commas (EUW and EUNE accounts both work) and are remembered for the team; without them the bot uses the saved ones or the most frequent opponents from our games against that team (by the `Przeciwnik` column in `Mecze`). For each player the report shows:
+`/scout <team> [players]` scouts an opponent for draft prep. Players are given as multi op.gg links (e.g. one for EUW and one for EUNE, separated by a space) or Riot IDs separated by commas, and are remembered for the team. Each account gets its own block, ordered by main role so a player's EUW and EUNE accounts end up next to each other; without them the bot uses the saved ones or the most frequent opponents from our games against that team (by the `Przeciwnik` column in `Mecze`). For each player the report shows:
 
 - rank (SoloQ and Flex) and main role,
 - champions in ranked this season and last season (up to `SCOUT_MAX_GAMES` newest games per season, default 100) with games, W/L, winrate and KDA,
-- champions in tournament-code and Clash games,
+- champions in tournament-code games (`type=tourney` in match-v5: only games of that account, and only when the organizer used Riot tournament codes) and Clash games (queue 700, fetched separately since `tourney` doesn't include them),
 - one-trick warnings,
 
 plus suggested bans (comfort picks by games and smoothed winrate, tournament games count triple), what the team picked and banned against us, pro-play priority and winrate of each champion from [gol.gg](https://gol.gg) (current season, all tournaments, cached for a day), and with an OpenRouter key a short summary. The embed goes to the channel and the full tables to the bot-only `Scouting` tab (overwritten by each scouting). Games are cached in `scout_games`, so the first scouting of a team can take 15–20 minutes because of the Riot API rate limit, and later ones only fetch new games. When the 24-hour (or day-before) reminder of an official (any type but Scrim) is posted and the opponent's players are known, the bot scouts it automatically and posts the report under the reminder.
@@ -175,7 +175,7 @@ sudo systemctl start lp-tracker
 
 | Command | Description |
 |---|---|
-| `/scout <team> [players]` | Scout an opponent; `players` is a multi op.gg link or Riot IDs, saved for the team |
+| `/scout <team> [players]` | Scout an opponent; `players` is multi op.gg links (EUW and EUNE) or Riot IDs, saved for the team |
 
 ### Comments on games
 

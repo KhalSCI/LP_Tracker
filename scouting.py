@@ -1,6 +1,7 @@
 """
-Opponent scouting for draft prep: each player's champions in ranked this season and last
-season (games, winrate, KDA) and in tournament games, from the Riot API (EUW and EUNE),
+Opponent scouting for draft prep: each account's champions in ranked this season and last
+season (games, winrate, KDA) and in tournament-code and Clash games, from the Riot API
+(EUW and EUNE accounts, e.g. two multi op.gg links in one scouting),
 with pro-play priority from gol.gg, suggested bans and what they played against us.
 Posted to Discord and written to the bot-only "Scouting" tab.
 """
@@ -25,6 +26,7 @@ from sheets import team_sheet
 
 SCOUTING_TAB = "Scouting"
 RANKED_QUEUES = {420: "SoloQ", 440: "Flex"}
+CLASH_QUEUE = 700
 SUMMONERS_RIFT = 11
 ROLES = ["Top", "Jungle", "Mid", "ADC", "Support"]
 POSITIONS = {"TOP": "Top", "JUNGLE": "Jungle", "MIDDLE": "Mid", "BOTTOM": "ADC", "UTILITY": "Support"}
@@ -32,13 +34,16 @@ PLATFORM_NAMES = {"euw1": "EUW", "eun1": "EUNE"}
 # match-v5 patch 16.x is season 2026 (gol.gg calls it S16)
 SEASON_OFFSET = 2010
 IDS_PAGE = 100
+# Tournament-code games and Clash games read per account since last season
 MAX_TOURNEY_GAMES = 100
 GOLGG_URL = "https://gol.gg/champion/list/season-S{season}/split-ALL/tournament-ALL/"
 PRO_META_TTL = 24 * 60 * 60
 PRO_META_ROWS = 20
-# Champions per player shown in the sheet and in the embed
+# Champions per player shown in the sheet, and in the embed (fewer when the embed gets too long)
 SHEET_CHAMPIONS = 10
-EMBED_CHAMPIONS = 4
+EMBED_CHAMPIONS = (4, 3, 2)
+# Discord rejects embeds over 6000 characters
+EMBED_MAX_LENGTH = 5900
 BAN_SUGGESTIONS = 5
 # Ranked games this season (or tournament games) a champion needs to be suggested as a ban
 MIN_BAN_GAMES = 5
@@ -241,13 +246,15 @@ def scout_rows(match_id: str, match_data: dict, puuids: set[str]) -> list[dict]:
     return rows
 
 
-async def fetch_match_ids(puuid: str, match_type: str, start_time: int, end_time: int | None, limit: int) -> list[str]:
-    """Up to limit match IDs of one type in a time window, newest first."""
+async def fetch_match_ids(puuid: str, match_type: str | None, start_time: int, end_time: int | None, limit: int,
+                          queue: int = None) -> list[str]:
+    """Up to limit match IDs of one type (or queue) in a time window, newest first."""
     ids = []
     while len(ids) < limit:
         count = min(IDS_PAGE, limit - len(ids))
         page = await riot_api.get_match_ids(
-            puuid, match_type=match_type, start_time=start_time, end_time=end_time, start=len(ids), count=count
+            puuid, match_type=match_type, start_time=start_time, end_time=end_time, start=len(ids), count=count,
+            queue=queue,
         )
         ids += page
         if len(page) < count:
@@ -257,14 +264,15 @@ async def fetch_match_ids(puuid: str, match_type: str, start_time: int, end_time
 
 async def sync_scout_games(puuid: str, scouted: set[str], year: int) -> int:
     """
-    Store a player's ranked games this season and last season (up to SCOUT_MAX_GAMES each,
-    newest first) and tournament games since last season. Games stored before aren't
-    fetched again. Returns how many games were fetched.
+    Store an account's ranked games this season and last season (up to SCOUT_MAX_GAMES each,
+    newest first) and tournament-code and Clash games since last season. Games stored
+    before aren't fetched again. Returns how many games were fetched.
     """
     known = await db.get_scout_match_ids(puuid)
     ids = await fetch_match_ids(puuid, "ranked", year_start(year), None, SCOUT_MAX_GAMES)
     ids += await fetch_match_ids(puuid, "ranked", year_start(year - 1), year_start(year), SCOUT_MAX_GAMES)
     ids += await fetch_match_ids(puuid, "tourney", year_start(year - 1), None, MAX_TOURNEY_GAMES)
+    ids += await fetch_match_ids(puuid, None, year_start(year - 1), None, MAX_TOURNEY_GAMES, queue=CLASH_QUEUE)
 
     new = [match_id for match_id in dict.fromkeys(ids) if match_id not in known]
     for match_id in new:
@@ -369,7 +377,7 @@ def ban_suggestions(players: list[dict]) -> list[dict]:
             if r:
                 reasons.append(f"{r['games']} gier, {pct(r['wr'])} WR w tym sezonie")
             if t:
-                reasons.append(f"{t['games']} w turniejach ({pct(t['wr'])} WR)")
+                reasons.append(f"{t['games']} w turniejach/Clashu ({pct(t['wr'])} WR)")
             candidates.append({
                 "champion": champion,
                 "player": player_name(player),
@@ -459,7 +467,7 @@ def summary_facts(report: dict) -> str:
         lines.append(
             f"{s['role'] or '?'} {player_name(player)} ({rank_text(player['ranks'].get('solo'))}): "
             f"sezon {year}: {pool_text(s['current'], 5)}; sezon {year - 1}: {pool_text(s['previous'], 3)}; "
-            f"turnieje: {pool_text(s['tournament'], 3)}"
+            f"turnieje i Clash: {pool_text(s['tournament'], 3)}"
             + (f"; one-trick {s['one_trick']['champion']} ({pct(s['one_trick']['share'])} gier)" if s["one_trick"] else "")
         )
     if report["bans"]:
@@ -517,12 +525,26 @@ async def run_scouting(team_name: str, riot_ids: list[str]) -> dict:
         return report
 
 
-def champion_line(table: list[dict], count: int = EMBED_CHAMPIONS) -> str:
+def champion_line(table: list[dict], count: int) -> str:
     return ", ".join(f"{c['champion']} {c['games']} ({pct(c['wr'])})" for c in table[:count]) or "brak gier"
 
 
 def build_embed(report: dict) -> discord.Embed:
-    """Short version of the report for Discord; full tables go to the sheet."""
+    """
+    Short version of the report for Discord (full tables go to the sheet), with fewer
+    champions per line when many accounts (e.g. EUW and EUNE ones) make it too long.
+    """
+    for count in EMBED_CHAMPIONS:
+        embed = embed_with(report, count)
+        if len(embed) <= EMBED_MAX_LENGTH:
+            return embed
+    if embed.description:
+        room = max(0, EMBED_MAX_LENGTH - (len(embed) - len(embed.description)))
+        embed.description = embed.description[:room] or None
+    return embed
+
+
+def embed_with(report: dict, count: int) -> discord.Embed:
     year = report["year"]
     embed = discord.Embed(
         title=f"🔎 Scouting: {report['team']}"[:256],
@@ -538,11 +560,11 @@ def build_embed(report: dict) -> discord.Embed:
         name = f"{s['role'] or '?'} · {player['riot_id']} · {PLATFORM_NAMES.get(player['platform'], player['platform'].upper())}"
         lines = [
             rank_text(player["ranks"].get("solo")),
-            f"**{year}:** {champion_line(s['current'])}",
-            f"**{year - 1}:** {champion_line(s['previous'])}",
+            f"**{year}:** {champion_line(s['current'], count)}",
+            f"**{year - 1}:** {champion_line(s['previous'], count)}",
         ]
         if s["tournament"]:
-            lines.append(f"**Turnieje:** {champion_line(s['tournament'])}")
+            lines.append(f"**Turnieje i Clash:** {champion_line(s['tournament'], count)}")
         if s["one_trick"]:
             lines.append(f"⚠ One-trick: {s['one_trick']['champion']} ({pct(s['one_trick']['share'])} gier w sezonie)")
         embed.add_field(name=name[:256], value="\n".join(lines)[:1024], inline=False)
@@ -592,7 +614,8 @@ def build_sheet_rows(report: dict) -> list[list]:
     add((0, [f"Scouting: {report['team']}"]))
     add((0, [
         f"Wygenerowano {report['created']:%d.%m.%Y %H:%M} · ranked (SoloQ i Flex) z sezonów {year} i {year - 1}, "
-        f"do {SCOUT_MAX_GAMES} ostatnich gier na sezon, plus gry turniejowe · pro: gol.gg S{year - SEASON_OFFSET}, wszystkie turnieje"
+        f"do {SCOUT_MAX_GAMES} ostatnich gier na sezon, plus gry z kodów turniejowych i Clash · "
+        f"pro: gol.gg S{year - SEASON_OFFSET}, wszystkie turnieje"
     ]))
     add()
     add((0, ["Sugerowane bany"]))
@@ -628,7 +651,7 @@ def build_sheet_rows(report: dict) -> list[list]:
         titles = [
             f"Sezon {year} (ranked, {s['current_games']} gier)",
             f"Sezon {year - 1} (ranked, {s['previous_games']} gier)",
-            "Turnieje (kody turniejowe, Clash)",
+            "Turnieje (kody turniejowe) i Clash",
         ]
         add(*[(column, [title]) for column, title in zip(BLOCK_COLUMNS, titles)])
         add(*[(column, BLOCK_HEADERS) for column in BLOCK_COLUMNS])

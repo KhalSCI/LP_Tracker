@@ -45,18 +45,14 @@ class TestMissingAvailability:
     def test_checks_the_next_three_days(self):
         assert DAYS == [date(2026, 10, 31), date(2026, 11, 1), date(2026, 11, 2)]
 
-    def test_question_mark_and_empty_count_as_missing(self):
+    def test_only_empty_cells_are_missing(self):
         missing = missing_availability(ROWS, ["drewin", "iym0409", "khal", "drukarz_lp", "freakk9"], DAYS)
 
-        assert missing == {
-            "drewin": [date(2026, 11, 1)],
-            "khal": [date(2026, 10, 31), date(2026, 11, 1)],
-            "drukarz_lp": [date(2026, 11, 1)],
-            "freakk9": DAYS,
-        }
+        assert missing == {"freakk9": DAYS}
 
-    def test_nie_counts_as_an_answer(self):
-        assert "iym0409" not in missing_availability(ROWS, ["iym0409"], DAYS)
+    def test_nie_and_question_mark_are_answers(self):
+        rows = [HEADER, row("31.10.2026", khal="nie", drewin=" ? ")]
+        assert missing_availability(rows, ["khal", "drewin"], DAYS[:1]) == {}
 
     def test_nick_without_column_is_skipped(self):
         assert missing_availability(ROWS, ["atomek"], DAYS) == {}
@@ -67,7 +63,7 @@ class TestMissingAvailability:
         assert missing == {"freakk9": [date(2026, 11, 2)]}
 
     def test_nick_case_is_ignored(self):
-        assert missing_availability(ROWS, ["KHAL"], DAYS) == {"KHAL": [date(2026, 10, 31), date(2026, 11, 1)]}
+        assert missing_availability(ROWS, ["FREAKK9"], DAYS) == {"FREAKK9": DAYS}
 
     def test_text_dates(self):
         rows = [HEADER, ["31.10.2026", "", ""] + [""] * (len(HEADER) - 3)]
