@@ -23,3 +23,7 @@ DOBRZE WIEDZIEĆ
 - Liczą się gry niestandardowe na Summoner's Rift, w których grało co najmniej
   3 naszych graczy w jednej drużynie. Resztę bot pomija.
 - Skrypt tylko czyta historię meczów z Twojego klienta, nic nie zmienia w grze.
+- Razem z grą idzie jej przebieg minuta po minucie (gold, CS, zabójstwa), z którego
+  bot liczy np. różnicę golda na linii w 15. minucie.
+- "Wyslij ponownie wszystko.cmd" wysyła jeszcze raz wszystkie scrimy z historii klienta.
+  Przydaje się po aktualizacji skryptu: bot dopisze przebieg gry do map, które już ma.

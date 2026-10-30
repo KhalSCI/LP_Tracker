@@ -9,6 +9,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import database as db
+from availability import find_missing_availability, format_day
 from riot_api import riot_api, RiotAPIError
 from sheets import team_sheet
 from config import (
@@ -468,6 +469,27 @@ class SheetCog(commands.Cog):
 
         msg = await interaction.followup.send(text, wait=True)
         await msg.delete(delay=AUTO_DELETE_SECONDS)
+
+    @sheet_group.command(name="availability", description="Show who would be pinged about missing availability (no pings)")
+    async def sheet_availability(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        if not GOOGLE_SHEET_ID:
+            await interaction.followup.send("❌ Sheet sync is not configured (GOOGLE_SHEET_ID is not set).")
+            return
+        try:
+            missing = await find_missing_availability(datetime.now(TIMEZONE).date())
+        except Exception as e:
+            await interaction.followup.send(f"❌ Nie udało się sprawdzić dostępności: {e}")
+            return
+        if not missing:
+            text = "✅ Wszyscy z głównego składu mają wpisaną dostępność na najbliższe dni."
+        else:
+            text = "Przypomnienie dostałby:\n" + "\n".join(
+                f"• **{discord.utils.escape_markdown(nick)}**: {', '.join(format_day(day) for day in days)}"
+                for nick, days in missing.items()
+            )
+        await interaction.followup.send(text)
 
 
 async def setup(bot: commands.Bot):

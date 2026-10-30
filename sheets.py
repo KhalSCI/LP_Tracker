@@ -1,5 +1,6 @@
 import asyncio
 import threading
+import time
 from pathlib import Path
 
 import gspread
@@ -27,6 +28,7 @@ class TeamSheet:
         self._spreadsheet: gspread.Spreadsheet | None = None
         # The sheet sync, reminders and uploads share one HTTP session from different threads
         self._lock = threading.Lock()
+        self._roster_cache: tuple[float, list[dict]] | None = None
 
     def _open(self) -> gspread.Spreadsheet:
         if self._spreadsheet is None:
@@ -47,22 +49,39 @@ class TeamSheet:
 
     async def read_roster(self) -> list[dict]:
         """Get the players listed with an EUW Riot ID in the roster tab, in sheet order."""
-        return await asyncio.to_thread(self._read_roster)
+        roster = await asyncio.to_thread(self._read_roster)
+        self._roster_cache = (time.monotonic(), roster)
+        return roster
 
-    def _read_tab(self, tab: str) -> list[list]:
+    async def read_roster_cached(self, max_age: float = 3600) -> list[dict]:
+        """The roster as last read, if not older than max_age seconds (for checks every few minutes)."""
+        if self._roster_cache and time.monotonic() - self._roster_cache[0] < max_age:
+            return self._roster_cache[1]
+        return await self.read_roster()
+
+    def _read_tab(self, tab: str, header_row: int) -> list[list]:
         with self._lock:
             rows = self._open().worksheet(tab).get(
                 value_render_option=ValueRenderOption.unformatted,
                 date_time_render_option=DateTimeOption.serial_number,
             )
-        return rows[HEADER_ROW - 1:]
+        return rows[header_row - 1:]
 
-    async def read_tab(self, tab: str) -> list[list]:
+    async def read_tab(self, tab: str, header_row: int = HEADER_ROW) -> list[list]:
         """
         Get the raw rows of a tab from its header row down, with dates and times as
         spreadsheet serial numbers.
         """
-        return await asyncio.to_thread(self._read_tab, tab)
+        return await asyncio.to_thread(self._read_tab, tab, header_row)
+
+    def _tab_url(self, tab: str) -> str:
+        with self._lock:
+            worksheet_id = self._open().worksheet(tab).id
+        return f"https://docs.google.com/spreadsheets/d/{self.sheet_id}/edit#gid={worksheet_id}"
+
+    async def tab_url(self, tab: str) -> str:
+        """Link that opens the sheet on this tab."""
+        return await asyncio.to_thread(self._tab_url, tab)
 
     async def read_matches(self) -> list[list]:
         """Get the raw rows of the matches tab from its header row down."""
@@ -119,6 +138,25 @@ class TeamSheet:
         request, first growing the tab to at least rows x cols.
         """
         await asyncio.to_thread(self._write, tab, updates, rows, cols)
+
+    def _replace_tab(self, tab: str, updates: list[dict], rows: int, cols: int) -> None:
+        with self._lock:
+            spreadsheet = self._open()
+            try:
+                worksheet = spreadsheet.worksheet(tab)
+            except gspread.WorksheetNotFound:
+                worksheet = spreadsheet.add_worksheet(tab, rows=rows, cols=cols)
+            worksheet.clear()
+            if worksheet.row_count < rows or worksheet.col_count < cols:
+                worksheet.resize(rows=max(rows, worksheet.row_count), cols=max(cols, worksheet.col_count))
+            worksheet.batch_update(updates, value_input_option="RAW")
+
+    async def replace_tab(self, tab: str, updates: list[dict], rows: int, cols: int) -> None:
+        """
+        Clear a tab written only by the bot (creating it if missing) and write value
+        ranges to it, growing it to at least rows x cols.
+        """
+        await asyncio.to_thread(self._replace_tab, tab, updates, rows, cols)
 
     async def write_soloq(self, updates: list[dict], rows: int, cols: int) -> None:
         """Write value ranges to the SoloQ tab (see write)."""

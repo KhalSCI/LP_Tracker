@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import database as db
 from champions import champions
 from config import TIMEZONE, SHEET_GUILD_ID, SHEET_LEADERBOARD
+from game_stats import store_new_game, add_client_timeline
 from reminders import from_sheet_serial
 from riot_api import riot_api, RiotAPIError
 from sheets import team_sheet, MATCHES_TAB, MAPS_TAB
@@ -335,10 +336,11 @@ async def known_game_ids() -> set[str]:
     return await db.get_team_game_ids() | await read_map_game_ids()
 
 
-async def ingest_games(games: list[dict]) -> dict:
+async def ingest_games(games: list[dict], raws: dict[str, tuple] = None) -> dict:
     """
     Add team games to "Mapy" (and new scrims to "Mecze") and store them, skipping games
-    already in the database or the sheet. Returns what was added, skipped and left unlinked.
+    already in the database or the sheet. raws maps match IDs to (source, raw JSON, timeline)
+    kept as the games' full data. Returns what was added, skipped and left unlinked.
     """
     async with _ingest_lock:
         known = await known_game_ids()
@@ -372,6 +374,8 @@ async def ingest_games(games: list[dict]) -> dict:
             await team_sheet.append_rows(MAPS_TAB, "Mecz", [map_row(g, label) for g, label in summary["added"]])
         for game, label in summary["added"]:
             await db.save_team_game(game, label)
+            if raws and game["match_id"] in raws:
+                await store_new_game(game, *raws[game["match_id"]])
         return summary
 
 
@@ -386,28 +390,38 @@ async def ingest_client_upload(payload: dict) -> dict:
     await champions.refresh()
     known = await known_game_ids()
 
-    games, already_known, not_ours = [], 0, 0
+    # Version 2 uploads also carry each game's timeline, keyed by game ID
+    timelines = payload.get("timelines") or {}
+    games, raws, already_known, not_ours, timelines_added = [], {}, 0, 0, 0
     for raw in payload.get("games", []):
         match_id = client_match_id(raw)
+        timeline = timelines.get(str(raw.get("gameId")))
         if match_id in known:
             already_known += 1
+            timelines_added += await add_client_timeline(match_id, raw, timeline)
             continue
         game = None
         try:
-            game = normalize_api_game(await riot_api.get_match_details(match_id), roster)
+            match_data = await riot_api.get_match_details(match_id)
+            game = normalize_api_game(match_data, roster)
+            if game:
+                raws[match_id] = ("api", match_data, None)
         except RiotAPIError as e:
             if e.status not in (403, 404):
                 raise
         if game is None:
             game = normalize_client_game(raw, roster)
+            if game:
+                raws[match_id] = ("client", raw, timeline)
         if game is None:
             not_ours += 1
         else:
             games.append(game)
 
-    summary = await ingest_games(games)
+    summary = await ingest_games(games, raws)
     summary["already_known"] += already_known
     summary["not_ours"] = not_ours
+    summary["timelines_added"] = timelines_added
     return summary
 
 
@@ -422,15 +436,17 @@ async def sync_official_games() -> dict:
         match_ids.update(await riot_api.get_tournament_match_ids(puuid, since))
         await asyncio.sleep(0.5)  # Rate limit
 
-    games = []
+    games, raws = [], {}
     for match_id in sorted(match_ids - await db.get_team_game_ids() - _not_team_games):
-        game = normalize_api_game(await riot_api.get_match_details(match_id), roster)
+        match_data = await riot_api.get_match_details(match_id)
+        game = normalize_api_game(match_data, roster)
         await asyncio.sleep(0.5)  # Rate limit
         if game is None:
             _not_team_games.add(match_id)
         else:
             games.append(game)
-    return await ingest_games(games)
+            raws[match_id] = ("api", match_data, None)
+    return await ingest_games(games, raws)
 
 
 def format_summary(summary: dict) -> str:
@@ -447,6 +463,8 @@ def format_summary(summary: dict) -> str:
         )
     if summary["unlinked"]:
         lines.append(f"⚠ Oficjale bez meczu w zakładce Mecze tego dnia: {len(summary['unlinked'])}. Dodaj mecz, a bot dopisze mapy.")
+    if summary.get("timelines_added"):
+        lines.append(f"📈 Dopisany przebieg gry do wcześniej dodanych map: {summary['timelines_added']}.")
     skipped = [f"{summary['already_known']} już były"]
     if summary.get("not_ours"):
         skipped.append(f"{summary['not_ours']} bez naszego składu")

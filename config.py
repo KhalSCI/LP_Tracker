@@ -25,10 +25,25 @@ REMINDER_CHANNEL_ID = int(os.getenv("REMINDER_CHANNEL_ID", 0))  # 0 = team leade
 REMINDER_ROLE_ID = int(os.getenv("REMINDER_ROLE_ID", 0))  # 0 = don't ping a role
 REMINDER_CHECK_INTERVAL = int(os.getenv("REMINDER_CHECK_INTERVAL", 300))  # 5 minutes
 
+# Pings about the "Dostępność" tab: Main players without an answer for the next days
+AVAILABILITY_HOUR = int(os.getenv("AVAILABILITY_HOUR", 12))  # local time of the daily check
+AVAILABILITY_DAYS = int(os.getenv("AVAILABILITY_DAYS", 3))  # days ahead, from tomorrow
+
+# Comments on SoloQ games written by an LLM through OpenRouter (templates without a key)
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash")
+ROASTS_ENABLED = os.getenv("ROASTS_ENABLED", "1") not in ("0", "false", "False", "")
+ROASTS_PER_DAY = int(os.getenv("ROASTS_PER_DAY", 3))  # per player
+
+# Opponent scouting: ranked games read per player (current and previous season, newest first)
+SCOUT_MAX_GAMES = int(os.getenv("SCOUT_MAX_GAMES", 200))
+
 # Riot API endpoints
 RIOT_ACCOUNT_API = "https://europe.api.riotgames.com"
 RIOT_EUW_API = "https://euw1.api.riotgames.com"
 RIOT_EUW_PLATFORM = "euw1"  # Only accounts on this platform are tracked
+# App rate limits of the API key as (requests, seconds), kept a bit under Riot's 20/1 s and 100/2 min
+RIOT_RATE_LIMITS = [(19, 1), (95, 120)]
 
 # Rank order for sorting (higher index = better rank)
 RANK_ORDER = {

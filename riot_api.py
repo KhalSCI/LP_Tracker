@@ -1,7 +1,9 @@
 import aiohttp
 import asyncio
+import time
+from collections import deque
 from urllib.parse import quote
-from config import RIOT_API_KEY, RIOT_ACCOUNT_API, RIOT_EUW_API
+from config import RIOT_API_KEY, RIOT_ACCOUNT_API, RIOT_EUW_API, RIOT_RATE_LIMITS
 
 
 class RiotAPIError(Exception):
@@ -12,12 +14,43 @@ class RiotAPIError(Exception):
         super().__init__(f"Riot API Error {status}: {message}")
 
 
+class RateLimiter:
+    """
+    Spaces out requests to stay under rate limits given as (requests, seconds) sliding
+    windows, shared by all background tasks so a long job (e.g. scouting) can't cause 429s.
+    """
+
+    def __init__(self, limits: list[tuple[int, float]]):
+        self.limits = limits
+        self._calls: deque[float] = deque()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            while True:
+                now = time.monotonic()
+                longest = max(seconds for _, seconds in self.limits)
+                while self._calls and now - self._calls[0] >= longest:
+                    self._calls.popleft()
+                wait = 0.0
+                for count, seconds in self.limits:
+                    recent = [t for t in self._calls if now - t < seconds]
+                    if len(recent) >= count:
+                        # Until the oldest call that keeps the window full drops out of it
+                        wait = max(wait, recent[len(recent) - count] + seconds - now)
+                if wait <= 0:
+                    self._calls.append(now)
+                    return
+                await asyncio.sleep(wait)
+
+
 class RiotAPI:
     """Async client for Riot Games API."""
 
     def __init__(self, api_key: str = None):
         self.api_key = api_key or RIOT_API_KEY
         self._session: aiohttp.ClientSession | None = None
+        self._limiter = RateLimiter(RIOT_RATE_LIMITS)
 
     @property
     def headers(self):
@@ -35,6 +68,7 @@ class RiotAPI:
     async def _request(self, url: str) -> dict | list:
         """Make an API request with basic rate limit handling."""
         session = await self._get_session()
+        await self._limiter.acquire()
 
         async with session.get(url) as response:
             if response.status == 200:
@@ -70,6 +104,11 @@ class RiotAPI:
         url = f"{RIOT_ACCOUNT_API}/riot/account/v1/region/by-game/lol/by-puuid/{puuid}"
         account_region = await self._request(url)
         return account_region.get("region", "").lower()
+
+    async def get_league_entries(self, puuid: str, platform: str = "euw1") -> list[dict]:
+        """All ranked entries (Solo/Duo, Flex) of an account on a platform, e.g. "euw1" or "eun1"."""
+        url = f"https://{platform}.api.riotgames.com/lol/league/v4/entries/by-puuid/{puuid}"
+        return await self._request(url)
 
     async def get_ranked_stats_by_puuid(self, puuid: str) -> dict | None:
         """
@@ -153,6 +192,30 @@ class RiotAPI:
             f"{RIOT_ACCOUNT_API}/lol/match/v5/matches/by-puuid/{puuid}/ids"
             f"?type=tourney&count={count}&startTime={start_time}"
         )
+        return await self._request(url)
+
+    async def get_match_ids(
+        self,
+        puuid: str,
+        match_type: str = None,
+        start_time: int = None,
+        start: int = 0,
+        count: int = 100
+    ) -> list[str]:
+        """
+        Get a page of a player's match IDs, newest first, optionally only one type
+        ("ranked", "tourney", ...) and only since start_time (Unix seconds).
+        """
+        url = f"{RIOT_ACCOUNT_API}/lol/match/v5/matches/by-puuid/{puuid}/ids?count={count}&start={start}"
+        if match_type:
+            url += f"&type={match_type}"
+        if start_time:
+            url += f"&startTime={start_time}"
+        return await self._request(url)
+
+    async def get_match_timeline(self, match_id: str) -> dict:
+        """Get a match's timeline: per-minute frames (gold, XP, CS, positions) and events."""
+        url = f"{RIOT_ACCOUNT_API}/lol/match/v5/matches/{match_id}/timeline"
         return await self._request(url)
 
     async def get_match_details(self, match_id: str) -> dict:

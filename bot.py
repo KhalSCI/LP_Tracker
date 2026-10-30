@@ -1,6 +1,6 @@
 import asyncio
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import discord
 from discord.ext import commands, tasks
 
@@ -10,20 +10,28 @@ from sheets import team_sheet
 from config import (
     DISCORD_TOKEN, UPDATE_INTERVAL, NOTIFICATION_INTERVAL, TIMEZONE,
     GOOGLE_SHEET_ID, SHEET_SYNC_INTERVAL, SHEET_GUILD_ID, SHEET_LEADERBOARD,
-    REMINDER_CHANNEL_ID, REMINDER_ROLE_ID, REMINDER_CHECK_INTERVAL,
+    REMINDER_CHANNEL_ID, REMINDER_ROLE_ID, REMINDER_CHECK_INTERVAL, AVAILABILITY_HOUR,
+    ROASTS_ENABLED, ROASTS_PER_DAY,
 )
 from cogs.tracker import create_leaderboard_embed
 from cogs.notifications import create_match_notification_embed
-from cogs.sheet import sync_team_sheet
+from cogs.sheet import sync_team_sheet, match_rows, SOLOQ_QUEUE, MATCH_HISTORY_DAYS, DAY_SECONDS
 from reminders import parse_planned_matches, due_reminders, create_reminder_message
 from team_games import sync_official_games
+from game_stats import backfill_game_data
 from drafts import update_drafts_tab
+from availability import AVAILABILITY_TAB, find_missing_availability, create_availability_message
+from members import find_member_id, mention
+from champions import champions
+from roasts import is_soloq_game, detect_trigger, multikills, lane_opponent, write_comment
 
 # notified_matches records older than this are deleted after each match check
 NOTIFIED_MATCH_RETENTION_DAYS = 7
 # Only matches started within this window are checked. Must stay shorter than the
 # retention above, or a match whose record was cleaned up would be posted again.
 MATCH_LOOKBACK_SECONDS = 24 * 60 * 60
+# The availability check runs once a day, from AVAILABILITY_HOUR; this is how often it looks at the clock
+AVAILABILITY_CHECK_INTERVAL = 30 * 60
 
 
 class LPTrackerBot(commands.Bot):
@@ -45,6 +53,7 @@ class LPTrackerBot(commands.Bot):
         await self.load_extension("cogs.notifications")
         await self.load_extension("cogs.sheet")
         await self.load_extension("cogs.scrims")
+        await self.load_extension("cogs.roasts")
 
         # Sync slash commands
         await self.tree.sync()
@@ -56,8 +65,9 @@ class LPTrackerBot(commands.Bot):
         if GOOGLE_SHEET_ID:
             self.update_team_sheet.start()
             self.check_match_reminders.start()
+            self.check_availability.start()
         else:
-            print("Team sheet sync and match reminders disabled (GOOGLE_SHEET_ID not set)")
+            print("Team sheet sync, match reminders and availability pings disabled (GOOGLE_SHEET_ID not set)")
 
     async def on_ready(self):
         print(f"Logged in as {self.user} (ID: {self.user.id})")
@@ -179,6 +189,7 @@ class LPTrackerBot(commands.Bot):
 
             # Get players for this leaderboard
             players = await db.get_players_for_leaderboard_notifications(leaderboard_id)
+            tracked_puuids = {p["puuid"] for p in players}
 
             for player in players:
                 puuid = player["puuid"]
@@ -197,7 +208,8 @@ class LPTrackerBot(commands.Bot):
                     else:
                         match_ids = player_matches_cache[puuid]
 
-                    for match_id in match_ids:
+                    # Oldest first, so streaks are counted with the earlier games already stored
+                    for match_id in reversed(match_ids):
                         # Check if already notified for THIS leaderboard
                         if await db.is_match_notified(leaderboard_id, match_id, puuid):
                             continue
@@ -229,10 +241,11 @@ class LPTrackerBot(commands.Bot):
                             player["riot_id"],
                             match_stats
                         )
-                        await channel.send(embed=embed)
+                        message = await channel.send(embed=embed)
 
                         # Mark as notified for this leaderboard
                         await db.mark_match_notified(leaderboard_id, match_id, puuid)
+                        await self.comment_on_game(message, player, match_data, match_stats, tracked_puuids)
 
                         # Small delay to avoid Discord rate limits
                         await asyncio.sleep(1)
@@ -242,6 +255,60 @@ class LPTrackerBot(commands.Bot):
 
         # Periodic cleanup of old match records
         await db.cleanup_old_notified_matches(days=NOTIFIED_MATCH_RETENTION_DAYS)
+
+    async def comment_on_game(self, message: discord.Message, player: dict, match_data: dict,
+                              match_stats: dict, tracked_puuids: set[str]) -> None:
+        """Reply to a SoloQ game notification with a comment (and a ping) when the game is worth one."""
+        if not ROASTS_ENABLED or match_stats["queue_id"] != SOLOQ_QUEUE or match_stats["remake"]:
+            return
+        puuid = player["puuid"]
+        try:
+            # Stored right away (the sheet sync would add it within the hour) so streaks include it
+            await db.save_matches(match_rows(match_stats["match_id"], match_data, tracked_puuids))
+            if await db.is_roasted(match_stats["match_id"], puuid):
+                return
+            nick = await self.roster_nick(player)
+            if nick is None:
+                return
+            midnight = datetime.now(TIMEZONE).replace(hour=0, minute=0, second=0, microsecond=0)
+            if await db.count_roasts_since(puuid, midnight.astimezone(timezone.utc)) >= ROASTS_PER_DAY:
+                return
+
+            start = match_stats["game_start_timestamp"]
+            history = [
+                game for game in await db.get_matches_since([puuid], start - MATCH_HISTORY_DAYS * DAY_SECONDS * 1000)
+                if is_soloq_game(game) and game["game_start"] <= start
+            ]
+            stats = dict(match_stats, **multikills(match_data, puuid))
+            trigger = detect_trigger(stats, history)
+            if trigger is None:
+                return
+            user_id = await find_member_id(message.guild, nick)
+            if user_id and await db.is_roast_optout(user_id):
+                return
+
+            await champions.refresh()
+            text = await write_comment(nick, player, stats, trigger, history, lane_opponent(match_data, puuid))
+            await message.reply(
+                f"{mention(user_id, nick)} {text}",
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False, roles=False, users=[discord.Object(user_id)] if user_id else False
+                ),
+            )
+            await db.mark_roasted(match_stats["match_id"], puuid, trigger["kind"])
+            print(f"Commented on {player['riot_id']}'s game {match_stats['match_id']}: {trigger['kind']}")
+        except Exception as e:
+            print(f"Error commenting on {player['riot_id']}'s game: {e}")
+
+    async def roster_nick(self, player: dict) -> str | None:
+        """The player's nick from the roster sheet; None if not in it (e.g. an ex-member)."""
+        if not GOOGLE_SHEET_ID:
+            return player.get("discord_name") or player["riot_id"]
+        for row in await team_sheet.read_roster_cached():
+            if row["riot_id"].lower() == player["riot_id"].lower():
+                return row["nick"] or row["riot_id"]
+        return None
 
     @check_match_notifications.before_loop
     async def before_match_check(self):
@@ -266,6 +333,13 @@ class LPTrackerBot(commands.Bot):
                 print(f"Official games: {len(summary['added'])} maps added, {len(summary['unlinked'])} without a match")
         except Exception as e:
             print(f"Error adding official games: {e}")
+
+        try:
+            filled = await backfill_game_data()
+            if filled:
+                print(f"Stored full data of {filled} earlier team games")
+        except Exception as e:
+            print(f"Error storing full data of earlier team games: {e}")
 
         try:
             maps = await update_drafts_tab()
@@ -317,6 +391,42 @@ class LPTrackerBot(commands.Bot):
             print(f"Match reminders: role {REMINDER_ROLE_ID} not found in {channel.guild.name}")
         elif role and not role.mentionable and not channel.permissions_for(channel.guild.me).mention_everyone:
             print(f"Match reminders: role @{role.name} is not mentionable and the bot can't mention all roles")
+
+    @tasks.loop(seconds=AVAILABILITY_CHECK_INTERVAL)
+    async def check_availability(self):
+        """Once a day from AVAILABILITY_HOUR: ping Main players without availability for the next days."""
+        now = datetime.now(TIMEZONE)
+        key = f"availability|{now:%Y-%m-%d}"
+        if now.hour < AVAILABILITY_HOUR or await db.is_reminder_sent(key):
+            return
+        try:
+            channel = await self.get_reminder_channel()
+            if not channel:
+                return
+            pinged = await self.send_availability_reminder(channel, now.date())
+            await db.mark_reminder_sent(key)
+            print(f"Availability check: {', '.join(pinged) if pinged else 'everyone filled in'}")
+        except Exception as e:
+            print(f"Error checking availability: {e}")
+
+    @check_availability.before_loop
+    async def before_availability_check(self):
+        await self.wait_until_ready()
+
+    async def send_availability_reminder(self, channel, today) -> list[str]:
+        """Post the availability reminder if someone is missing. Returns the pinged nicks."""
+        missing = await find_missing_availability(today)
+        if not missing:
+            return []
+        user_ids = {nick: await find_member_id(channel.guild, nick) for nick in missing}
+        content = create_availability_message(
+            [(mention(user_ids[nick], nick), days) for nick, days in missing.items()],
+            await team_sheet.tab_url(AVAILABILITY_TAB),
+        )
+        await channel.send(content, allowed_mentions=discord.AllowedMentions(
+            everyone=False, roles=False, users=[discord.Object(i) for i in user_ids.values() if i]
+        ))
+        return list(missing)
 
     async def get_reminder_channel(self):
         """The channel for match reminders: REMINDER_CHANNEL_ID, else the team leaderboard's notification channel."""

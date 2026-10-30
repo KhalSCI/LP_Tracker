@@ -11,9 +11,10 @@ A Discord bot that tracks League of Legends ranked LP across your friend group. 
 - **Leaderboards** — Create multiple named leaderboards per server, each with its own channel for auto-updating rank embeds
 - **Live rank tracking** — Pulls tier, division, LP, wins, losses, and winrate from the Riot API (Solo/Duo queue)
 - **Win/loss notifications** — Per-leaderboard match notifications with champion, KDA, CS/min, and game duration
+- **Comments on SoloQ games** — Streaks, int games, pentakills and off-pool picks get a short ironic comment (written by a cheap LLM through OpenRouter, or from templates) that pings the player
 - **Slash commands** — Full Discord slash command interface with autocomplete
 - **Auto-updates** — Background tasks refresh leaderboards hourly and check for new matches every 5 minutes (configurable)
-- **Team Google Sheet sync** (optional) — Takes the roster from a Google Sheet and writes ranks, weekly activity, LP change, recent champions and games played together back to it
+- **Team Google Sheet sync** (optional) — Takes the roster from a Google Sheet and writes ranks, weekly activity, LP change, recent champions and games played together back to it; reminds about matches and missing availability, and keeps full data of scrims and officials
 - **SQLite storage** — Lightweight, no external database needed
 
 ## Requirements
@@ -76,6 +77,10 @@ REMINDER_CHANNEL_ID=                # empty = the team leaderboard's notificatio
 
 The role is pinged only if it is mentionable or the bot has the "Mention @everyone, @here and All Roles" permission.
 
+#### Availability pings
+
+Once a day from `AVAILABILITY_HOUR` (default 12:00) the bot checks the `Dostępność` tab for the next `AVAILABILITY_DAYS` days (default 3, from tomorrow). Players with status `Main` in `Skład` whose cell for one of those days is empty or `?` get one message on the reminders channel that pings them and lists the days; `nie` counts as an answer. Nicks are matched to Discord members by name (cached in the database), so no privileged intent is needed. `/sheet availability` shows who would be pinged right now, without pinging.
+
 #### Scrims, officials and drafts
 
 The Riot API doesn't return regular custom games, so scrims come from the LoL client:
@@ -84,6 +89,20 @@ The Riot API doesn't return regular custom games, so scrims come from the LoL cl
 - The bot takes webhook messages with that file in the team server, recognizes our team (3+ of our players on one side, by Riot ID), and appends one row per map to the `Mapy` tab: result, side, players and champions per role, enemy picks and game ID. Each map is linked to that day's scrim in `Mecze` (or a new scrim row is added). Games are deduplicated by game ID in the database and the sheet, so sending the same games again changes nothing.
 - Officials played with tournament codes are in the Riot API: every sheet sync the bot looks up our players' tournament games from the last 14 days and adds those that match an official in `Mecze` that day.
 - The `Drafty` tab is rebuilt every sync from `Mapy`: our champions per player (scrim/official record and SoloQ winrate), enemy champions we faced, bot lane and jungle-mid pairs, side winrate, and bans against us.
+- Full data of every team game is kept for later analysis (SoloQ games are not): the raw Riot API or LoL client JSON with its timeline goes to `team_game_raw` (gzipped), and `team_game_stats` gets one row per player of both teams: role, champion, KDA, kill participation, CS/min, gold and damage share, vision, wards, first blood, deaths before 14 minutes, and gold/CS/XP difference to the lane opponent at 10 and 15 minutes. Officials' timelines come from the Riot API; scrim timelines are sent by the uploader (format version 2). Roles missing in custom games are worked out from the timeline (jungle camps, lane positions). Games added before this are filled in from the saved uploads in `uploads/` during the sheet sync, and re-sending scrims (`Wyslij ponownie wszystko.cmd`) adds timelines to maps the bot already has.
+
+#### Comments on SoloQ games
+
+When a SoloQ game of a roster player is posted to the notification channel, the bot looks at it with the player's last 30 days of SoloQ and may reply with a short comment that pings the player: 3/5/7/10+ game win or lose streaks, the end of a 4+ streak, pentakills and great games, int games (10+ deaths, KDA under 1), losses on a champion outside the player's pool while a comfort pick has 60%+ winrate, and the third loss of the night. At most `ROASTS_PER_DAY` comments per player a day (default 3); players can turn them off with `/roast off`. Only players listed in `Skład` get comments.
+
+The text comes from a cheap model through [OpenRouter](https://openrouter.ai), fed only the game's facts (recent games, champion pool, lane opponent, rank). Without a key, or when the request fails, a template is used instead.
+
+```env
+OPENROUTER_API_KEY=                 # empty = template comments
+OPENROUTER_MODEL=deepseek/deepseek-v4.1-flash
+ROASTS_ENABLED=1
+ROASTS_PER_DAY=3
+```
 
 Run:
 
@@ -134,6 +153,14 @@ sudo systemctl start lp-tracker
 | Command | Description |
 |---|---|
 | `/sheet sync` | Sync the team Google Sheet now |
+| `/sheet availability` | Show who would be pinged about missing availability (no pings) |
+
+### Comments on games
+
+| Command | Description |
+|---|---|
+| `/roast off` | Turn off comments on your SoloQ games |
+| `/roast on` | Turn them back on |
 
 ## How it works
 
@@ -141,11 +168,15 @@ The bot runs two background loops:
 
 1. **Leaderboard updater** (hourly) — Fetches current ranked stats for every tracked player via the Riot API, updates the database, and edits the pinned leaderboard embed in the configured channel. Players are sorted by rank (tier + division + LP).
 
-2. **Match checker** (every 5 min) — Polls recent ranked matches for all tracked players. When a new match is found, it sends a notification embed with the result, champion played, KDA, CS/min, and game duration. Matches are deduplicated per leaderboard to avoid spam.
+2. **Match checker** (every 5 min) — Polls recent ranked matches for all tracked players. When a new match is found, it sends a notification embed with the result, champion played, KDA, CS/min, and game duration, and may reply with a comment (see above). Matches are deduplicated per leaderboard to avoid spam.
 
 3. **Team sheet sync** (hourly, only when `GOOGLE_SHEET_ID` is set) — Syncs the roster from the sheet, stores new SoloQ/Flex games, and writes the stats to the sheet (see above).
 
 4. **Match reminders** (every 5 min, only when `GOOGLE_SHEET_ID` is set) — Posts reminders about planned matches from the sheet's `Mecze` tab, pinging the team role.
+
+5. **Availability check** (daily from `AVAILABILITY_HOUR`, only when `GOOGLE_SHEET_ID` is set) — Pings Main players without availability for the next days.
+
+All Riot API requests share one rate limiter (kept just under 20 requests per second and 100 per 2 minutes), so long jobs don't run into 429s.
 
 ## Architecture
 
@@ -156,19 +187,26 @@ riot_api.py         — Async Riot API client (account lookup, ranked stats, mat
 database.py         — SQLite schema, CRUD operations
 sheets.py           — Google Sheets client for the team spreadsheet
 reminders.py        — Match reminder schedule and messages
+availability.py     — Pings about missing availability in the Dostępność tab
+roasts.py           — Comments on SoloQ games (triggers, prompt, templates)
+llm.py              — OpenRouter client for short texts
+members.py          — Discord members found by roster nick
 team_games.py       — Scrims (client uploads) and officials (Riot API) into Mecze/Mapy
+game_stats.py       — Full data of team games: raw JSON, timelines, per-player stats
 drafts.py           — Drafty tab analysis
 champions.py        — Champion names from Data Dragon
 uploader/           — Windows script that sends scrims from the LoL client
 cogs/
   tracker.py        — Leaderboard/player slash commands, embed formatting
   notifications.py  — Match notification commands and embeds
-  sheet.py          — Team sheet sync (roster, match history, stats) and /sheet sync
+  sheet.py          — Team sheet sync (roster, match history, stats), /sheet sync and /sheet availability
+  scrims.py         — Scrim uploads from the webhook
+  roasts.py         — /roast on|off
 ```
 
 ## API note
 
-The free Riot API key (Development key) expires every 24 hours. For a permanent key, apply for a [Production API key](https://developer.riotgames.com/docs/portal#product-registration) or use a [Riot Games Third-Party Application](https://developer.riotgames.com/docs/portal#product-registration_personal-api-keys) personal key.
+The free Riot API key (Development key) expires every 24 hours. For a permanent key, register a [personal API key](https://developer.riotgames.com/docs/portal#product-registration_personal-api-keys) (doesn't expire, same rate limits: 20 requests per second, 100 per 2 minutes) or apply for a [Production API key](https://developer.riotgames.com/docs/portal#product-registration).
 
 The bot is currently configured for the EUW region. To change the region, edit the API endpoints in `config.py`.
 

@@ -1,3 +1,4 @@
+import gzip
 import json
 
 import aiosqlite
@@ -122,6 +123,109 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS match_reminders (
                 reminder_key TEXT PRIMARY KEY,
                 sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Discord user IDs of the nicks written in the roster sheet
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS discord_members (
+                nick TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Comments posted on SoloQ games, one per game and player
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS roasts (
+                match_id TEXT NOT NULL,
+                puuid TEXT NOT NULL,
+                trigger TEXT NOT NULL,
+                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (match_id, puuid)
+            )
+        """)
+        # Discord users who turned the comments off
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS roast_optout (
+                user_id INTEGER PRIMARY KEY
+            )
+        """)
+        # Full data of team games (scrims, officials) as the Riot API or LoL client gave it, gzipped JSON
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS team_game_raw (
+                match_id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                game BLOB NOT NULL,
+                timeline BLOB,
+                saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Per-player stats of team games, both teams, computed from team_game_raw
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS team_game_stats (
+                match_id TEXT NOT NULL,
+                participant_id INTEGER NOT NULL,
+                start_ms INTEGER,
+                duration_s INTEGER,
+                patch TEXT,
+                tournament BOOLEAN,
+                ours BOOLEAN,
+                team_id INTEGER,
+                side TEXT,
+                player TEXT,
+                riot_id TEXT,
+                role TEXT,
+                champion TEXT,
+                win BOOLEAN,
+                kills INTEGER,
+                deaths INTEGER,
+                assists INTEGER,
+                kill_participation REAL,
+                cs INTEGER,
+                cs_per_min REAL,
+                gold INTEGER,
+                gold_share REAL,
+                damage INTEGER,
+                damage_share REAL,
+                damage_taken INTEGER,
+                vision_score INTEGER,
+                wards_placed INTEGER,
+                wards_killed INTEGER,
+                control_wards INTEGER,
+                first_blood BOOLEAN,
+                deaths_before_14 INTEGER,
+                gold_diff_10 INTEGER,
+                gold_diff_15 INTEGER,
+                cs_diff_10 INTEGER,
+                cs_diff_15 INTEGER,
+                xp_diff_15 INTEGER,
+                lane_opponent TEXT,
+                PRIMARY KEY (match_id, participant_id)
+            )
+        """)
+        # Ranked games of scouted opponents, one row per (account, game)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS scout_games (
+                puuid TEXT NOT NULL,
+                match_id TEXT NOT NULL,
+                queue_id INTEGER,
+                game_start INTEGER,
+                season INTEGER,
+                champion TEXT,
+                role TEXT,
+                win BOOLEAN,
+                kills INTEGER,
+                deaths INTEGER,
+                assists INTEGER,
+                PRIMARY KEY (puuid, match_id)
+            )
+        """)
+        # Opponent teams' Riot IDs, saved by /scout
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS opponents (
+                name_key TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                players TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         # Migration: Add notifications_enabled_at column if it doesn't exist
@@ -436,7 +540,7 @@ async def get_players_for_leaderboard_notifications(leaderboard_id: int) -> list
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT puuid, riot_id FROM players
+            """SELECT puuid, riot_id, discord_name, tier, rank, lp FROM players
                WHERE leaderboard_id = ? AND puuid IS NOT NULL""",
             (leaderboard_id,)
         )
@@ -693,3 +797,206 @@ async def get_team_games() -> list[dict]:
         cursor = await db.execute("SELECT match_label, data FROM team_games ORDER BY start_ms")
         rows = await cursor.fetchall()
         return [dict(json.loads(data), match_label=label) for label, data in rows]
+
+
+async def get_discord_user_id(nick: str, max_age_days: int = 7) -> int | None:
+    """Get the cached Discord user ID for a roster nick, unless it is older than max_age_days."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """SELECT user_id FROM discord_members
+               WHERE nick = ? AND updated_at >= datetime('now', ?)""",
+            (nick.lower(), f"-{max_age_days} days")
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
+async def set_discord_user_id(nick: str, user_id: int) -> None:
+    """Cache the Discord user ID of a roster nick."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO discord_members (nick, user_id) VALUES (?, ?)
+               ON CONFLICT(nick) DO UPDATE SET user_id = excluded.user_id, updated_at = CURRENT_TIMESTAMP""",
+            (nick.lower(), user_id)
+        )
+        await db.commit()
+
+
+async def get_discord_nick(user_id: int) -> str | None:
+    """Get the roster nick cached for a Discord user ID."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT nick FROM discord_members WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
+async def is_roasted(match_id: str, puuid: str) -> bool:
+    """Check if a game of this player already got a comment."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM roasts WHERE match_id = ? AND puuid = ?", (match_id, puuid)
+        )
+        return await cursor.fetchone() is not None
+
+
+async def count_roasts_since(puuid: str, since: datetime) -> int:
+    """Count comments on this player's games posted since a UTC time."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM roasts WHERE puuid = ? AND sent_at >= ?",
+            (puuid, since.strftime("%Y-%m-%d %H:%M:%S"))
+        )
+        return (await cursor.fetchone())[0]
+
+
+async def mark_roasted(match_id: str, puuid: str, trigger: str) -> None:
+    """Record that a game of this player got a comment."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO roasts (match_id, puuid, trigger) VALUES (?, ?, ?)",
+            (match_id, puuid, trigger)
+        )
+        await db.commit()
+
+
+async def set_roast_optout(user_id: int, opted_out: bool) -> None:
+    """Turn comments on a Discord user's games off (opted_out) or back on."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        if opted_out:
+            await db.execute("INSERT OR IGNORE INTO roast_optout (user_id) VALUES (?)", (user_id,))
+        else:
+            await db.execute("DELETE FROM roast_optout WHERE user_id = ?", (user_id,))
+        await db.commit()
+
+
+async def is_roast_optout(user_id: int) -> bool:
+    """Check if a Discord user turned the comments off."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT 1 FROM roast_optout WHERE user_id = ?", (user_id,))
+        return await cursor.fetchone() is not None
+
+
+def _pack(data) -> bytes | None:
+    return gzip.compress(json.dumps(data).encode()) if data is not None else None
+
+
+def _unpack(blob: bytes | None):
+    return json.loads(gzip.decompress(blob)) if blob else None
+
+
+async def save_team_game_raw(match_id: str, source: str, game: dict, timeline: dict | None) -> None:
+    """Store a team game's full data (and timeline), keeping a stored timeline if none is given."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO team_game_raw (match_id, source, game, timeline) VALUES (?, ?, ?, ?)
+               ON CONFLICT(match_id) DO UPDATE SET
+                   source = excluded.source, game = excluded.game,
+                   timeline = COALESCE(excluded.timeline, team_game_raw.timeline)""",
+            (match_id, source, _pack(game), _pack(timeline))
+        )
+        await db.commit()
+
+
+async def get_team_game_raw(match_id: str) -> dict | None:
+    """Get a team game's full data as {"source", "game", "timeline"}."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT source, game, timeline FROM team_game_raw WHERE match_id = ?", (match_id,)
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {"source": row[0], "game": _unpack(row[1]), "timeline": _unpack(row[2])}
+
+
+async def get_team_game_raw_ids() -> set[str]:
+    """Get the match IDs of team games with full data stored."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT match_id FROM team_game_raw")
+        return {row[0] for row in await cursor.fetchall()}
+
+
+async def save_team_game_stats(match_id: str, rows: list[dict]) -> None:
+    """Replace a team game's per-player stats."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM team_game_stats WHERE match_id = ?", (match_id,))
+        if rows:
+            columns = list(rows[0])
+            await db.executemany(
+                f"INSERT INTO team_game_stats ({', '.join(columns)}) VALUES ({', '.join(':' + c for c in columns)})",
+                rows
+            )
+        await db.commit()
+
+
+async def get_team_game_stats(match_id: str = None) -> list[dict]:
+    """Get per-player stats of one team game, or of all of them."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if match_id:
+            cursor = await db.execute(
+                "SELECT * FROM team_game_stats WHERE match_id = ? ORDER BY participant_id", (match_id,)
+            )
+        else:
+            cursor = await db.execute("SELECT * FROM team_game_stats ORDER BY start_ms, participant_id")
+        return [dict(row) for row in await cursor.fetchall()]
+
+
+async def get_scout_match_ids(puuid: str) -> set[str]:
+    """Get the match IDs already stored for a scouted account."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT match_id FROM scout_games WHERE puuid = ?", (puuid,))
+        return {row[0] for row in await cursor.fetchall()}
+
+
+async def save_scout_games(rows: list[dict]) -> None:
+    """Store games of scouted accounts, skipping ones already stored."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany(
+            """INSERT OR IGNORE INTO scout_games
+               (puuid, match_id, queue_id, game_start, season, champion, role, win, kills, deaths, assists)
+               VALUES (:puuid, :match_id, :queue_id, :game_start, :season, :champion, :role, :win,
+                       :kills, :deaths, :assists)""",
+            rows
+        )
+        await db.commit()
+
+
+async def get_scout_games(puuid: str, since_ms: int = 0) -> list[dict]:
+    """Get a scouted account's stored games since since_ms, newest first."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM scout_games WHERE puuid = ? AND game_start >= ? ORDER BY game_start DESC",
+            (puuid, since_ms)
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+
+async def save_opponent(name: str, players: list[str]) -> None:
+    """Save an opponent team's Riot IDs under its name (case-insensitive)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO opponents (name_key, name, players) VALUES (?, ?, ?)
+               ON CONFLICT(name_key) DO UPDATE SET
+                   name = excluded.name, players = excluded.players, updated_at = CURRENT_TIMESTAMP""",
+            (name.strip().lower(), name.strip(), json.dumps(players))
+        )
+        await db.commit()
+
+
+async def get_opponent(name: str) -> dict | None:
+    """Get a saved opponent team as {"name", "players"}."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT name, players FROM opponents WHERE name_key = ?", (name.strip().lower(),)
+        )
+        row = await cursor.fetchone()
+        return {"name": row[0], "players": json.loads(row[1])} if row else None
+
+
+async def get_opponents() -> list[dict]:
+    """Get all saved opponent teams, most recently updated first."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT name, players FROM opponents ORDER BY updated_at DESC")
+        return [{"name": name, "players": json.loads(players)} for name, players in await cursor.fetchall()]

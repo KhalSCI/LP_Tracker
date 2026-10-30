@@ -91,6 +91,8 @@ def channel():
 def lp_bot(monkeypatch, channel):
     """The bot with Discord and sleeps stubbed out."""
     monkeypatch.setattr(bot_module, "asyncio", SimpleNamespace(sleep=AsyncMock()))
+    # Not in the roster sheet, so no comments on games (tests for those are in test_roasts.py)
+    monkeypatch.setattr(bot_module.team_sheet, "read_roster_cached", AsyncMock(return_value=[]))
     lp_bot = bot_module.LPTrackerBot()
     monkeypatch.setattr(lp_bot, "get_channel", lambda channel_id: channel)
     return lp_bot

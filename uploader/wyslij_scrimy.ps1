@@ -19,7 +19,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $UploadFormat = 'lp-tracker-scrims'
 $UploadFileName = 'lp-tracker-scrims.json'
-$GamesPerUpload = 10
+# Timelines make each game bigger; a Discord webhook upload can be at most 10 MB
+$GamesPerUpload = 5
 $HistorySize = 20
 $SummonersRift = 11
 $DataDir = Join-Path $env:APPDATA 'LP Tracker'
@@ -106,10 +107,21 @@ function Get-CustomGameIds($Lcu) {
         ForEach-Object { [string]$_.gameId })
 }
 
-function Send-Games([string]$WebhookUrl, [string[]]$GameJsons, [string]$Uploader) {
+function Get-GameTimeline($Lcu, [string]$GameId) {
+    # Minute-by-minute data of the game (gold, CS, positions, kills) as '"<gameId>":{...}', or $null
+    try {
+        return '"' + $GameId + '":' + (Invoke-Lcu $Lcu "/lol-match-history/v1/game-timelines/$GameId")
+    }
+    catch {
+        Write-Host "Brak przebiegu gry $GameId ($($_.Exception.Message)), wysyłam ją bez niego."
+        return $null
+    }
+}
+
+function Send-Games([string]$WebhookUrl, [string[]]$GameJsons, [string[]]$TimelineJsons, [string]$Uploader) {
     # Game JSON is passed through as the client returned it, so nothing gets cut
-    $json = '{"format":"' + $UploadFormat + '","version":1,"uploader":' + (ConvertTo-Json $Uploader) +
-        ',"games":[' + ($GameJsons -join ',') + ']}'
+    $json = '{"format":"' + $UploadFormat + '","version":2,"uploader":' + (ConvertTo-Json $Uploader) +
+        ',"games":[' + ($GameJsons -join ',') + '],"timelines":{' + ($TimelineJsons -join ',') + '}}'
     $payload = ConvertTo-Json @{ content = "Scrimy z klienta LoL ($Uploader): $($GameJsons.Count) gier" } -Compress
 
     $content = New-Object System.Net.Http.MultipartFormDataContent
@@ -149,7 +161,8 @@ function Send-NewScrims([string]$WebhookUrl, [bool]$Quiet) {
     for ($i = 0; $i -lt $ids.Count; $i += $GamesPerUpload) {
         $batch = @($ids[$i..([Math]::Min($i + $GamesPerUpload, $ids.Count) - 1)])
         $jsons = @($batch | ForEach-Object { Invoke-Lcu $lcu "/lol-match-history/v1/games/$_" })
-        Send-Games $WebhookUrl $jsons $uploader
+        $timelines = @($batch | ForEach-Object { Get-GameTimeline $lcu $_ } | Where-Object { $_ })
+        Send-Games $WebhookUrl $jsons $timelines $uploader
         Add-Content -Path $SentFile -Value $batch
         Write-Host "Wysłano $($batch.Count) gier. Bot odpisze na kanale, co dodał do arkusza."
     }
