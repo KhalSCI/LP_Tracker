@@ -57,11 +57,13 @@ h2 { font-size:18px; margin:34px 0 12px; padding-bottom:6px; border-bottom:1px s
 .answers { display:grid; gap:10px; } .answer-role { padding:0; overflow:hidden; }
 .answer-role > header { padding:8px 14px; background:var(--surface2); border-bottom:1px solid var(--border); font-size:13px; color:var(--muted); }
 .answer-role > header b { color:var(--text); font-size:14px; margin-right:6px; }
-.pick { display:grid; grid-template-columns:minmax(150px,220px) 1fr; gap:10px; padding:8px 14px; border-top:1px solid var(--border); align-items:center; }
+.pick { display:grid; grid-template-columns:minmax(130px,170px) 1fr; gap:10px; padding:8px 14px; border-top:1px solid var(--border); align-items:center; }
 .pick:first-of-type { border-top:none; } .pick .them { display:flex; align-items:center; gap:8px; }
 .pick .them small { display:block; color:var(--muted); font-size:12px; }
-.pick .chips .chip small { color:var(--muted); margin-left:2px; }
-@media (max-width:700px) { .pick { grid-template-columns:1fr; } }
+.pick .chips { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); } .pick .chips > .meta { grid-column:1 / -1; }
+.chip.answer { border-radius:10px; padding:4px 8px 4px 4px; min-width:0; } .chip.answer > span { min-width:0; white-space:nowrap; }
+.chip.answer b { font-weight:500; } .chip.answer small { display:block; color:var(--muted); font-size:11px; overflow:hidden; text-overflow:ellipsis; }
+@media (max-width:700px) { .pick { grid-template-columns:1fr; } .pick .chips { grid-template-columns:repeat(2,minmax(0,1fr)); } }
 .blocks { display:grid; grid-template-columns:repeat(3,1fr); gap:0; }
 .block { padding:12px 16px; border-left:1px solid var(--border); } .block:first-child { border-left:none; }
 .block h4 { margin:0 0 8px; font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
@@ -237,11 +239,11 @@ def answers_section(answers: list[dict]) -> str:
             counts = " · ".join(part for part in (
                 f"{pick['tourney']} turn." if pick["tourney"] else "", f"{pick['soloq']} SoloQ" if pick["soloq"] else "") if part)
             chips_html = "".join(
-                f'<span class="chip">{icon(a["champion"])}{escape(a["champion"])} {wr_cell(a["wr"])}'
-                f'<small>{a["games"]}'
+                f'<span class="chip answer">{icon(a["champion"])}<span><b>{escape(a["champion"])}</b> {wr_cell(a["wr"])}'
+                f'<small>{games_count(a["games"])}'
                 + (f' · scrimy {scouting.record_text(a["ours"]["scrims"])}' if a["ours"]["scrims"][0] else "")
                 + (f' · SoloQ {scouting.record_text(a["ours"]["soloq"])}' if a["ours"]["soloq"][0] else "")
-                + "</small></span>"
+                + "</small></span></span>"
                 for a in pick["answers"]
             ) or '<span class="meta">brak danych o matchupach z naszą pulą</span>'
             picks += (f'<div class="pick"><div class="them">{icon(pick["champion"])}<div>{escape(pick["champion"])}'

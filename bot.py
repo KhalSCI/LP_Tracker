@@ -36,6 +36,8 @@ MATCH_LOOKBACK_SECONDS = 24 * 60 * 60
 SCOUTING_REMINDERS = ("|24h", "|day")
 # The availability check runs once a day, from AVAILABILITY_HOUR; this is how often it looks at the clock
 AVAILABILITY_CHECK_INTERVAL = 30 * 60
+# gol.gg pro data is downloaded again once the stored copy is a day old; this is how often that's checked
+PRO_META_CHECK_INTERVAL = 60 * 60
 
 
 class LPTrackerBot(commands.Bot):
@@ -67,6 +69,7 @@ class LPTrackerBot(commands.Bot):
         # Start background tasks
         self.update_leaderboards.start()
         self.check_match_notifications.start()
+        self.refresh_pro_meta.start()
         if GOOGLE_SHEET_ID:
             self.update_team_sheet.start()
             self.check_match_reminders.start()
@@ -465,6 +468,18 @@ class LPTrackerBot(commands.Bot):
             everyone=False, roles=False, users=[discord.Object(i) for i in user_ids.values() if i]
         ))
         return list(missing)
+
+    @tasks.loop(seconds=PRO_META_CHECK_INTERVAL)
+    async def refresh_pro_meta(self):
+        """Keep the stored gol.gg pro data for scouting at most a day old (downloads only when it's older)."""
+        try:
+            await scouting.fetch_pro_meta(datetime.now(TIMEZONE).year)
+        except Exception as e:
+            print(f"Error refreshing pro meta: {e}")
+
+    @refresh_pro_meta.before_loop
+    async def before_pro_meta_refresh(self):
+        await self.wait_until_ready()
 
     async def get_reminder_channel(self):
         """The channel for match reminders: REMINDER_CHANNEL_ID, else the team leaderboard's notification channel."""

@@ -255,6 +255,14 @@ async def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Pro-play champion stats from gol.gg (JSON), downloaded at most once a day
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS pro_meta (
+                season INTEGER PRIMARY KEY,
+                data TEXT NOT NULL,
+                fetched_at INTEGER NOT NULL
+            )
+        """)
         # Migration: Add notifications_enabled_at column if it doesn't exist
         try:
             await db.execute(
@@ -1146,6 +1154,24 @@ async def get_opponent(name: str) -> dict | None:
         )
         row = await cursor.fetchone()
         return {"name": row[0], "players": json.loads(row[1])} if row else None
+
+
+async def save_pro_meta(season: int, meta: dict, fetched_at: int) -> None:
+    """Store a season's pro-play stats (replacing the older copy)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO pro_meta (season, data, fetched_at) VALUES (?, ?, ?)",
+            (season, json.dumps(meta), fetched_at)
+        )
+        await db.commit()
+
+
+async def get_pro_meta(season: int) -> dict | None:
+    """A season's stored pro-play stats as {"meta", "fetched_at"} (unix seconds), or None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT data, fetched_at FROM pro_meta WHERE season = ?", (season,))
+        row = await cursor.fetchone()
+        return {"meta": json.loads(row[0]), "fetched_at": row[1]} if row else None
 
 
 async def get_opponents() -> list[dict]:

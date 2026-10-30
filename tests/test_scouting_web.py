@@ -69,7 +69,7 @@ class TestRender:
         assert '<span class="tag comfort">🎯 komfort</span><span class="tag counter">⚔ kontruje nas</span>' in page
         assert "Syndra ma 45% (600 gier)" in page
         assert "<h2>Nasze odpowiedzi</h2>" in page and "3 turn. · 10 SoloQ" in page
-        assert 'class="wr good">62%</span><small>900 · scrimy 1-1</small>' in page
+        assert 'class="wr good">62%</span><small>900 gier · scrimy 1-1</small>' in page
         assert "brak danych o matchupach z naszą pulą" in page
 
     def test_unknown_champion_gets_an_empty_icon(self):

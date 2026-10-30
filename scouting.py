@@ -67,6 +67,7 @@ PERIODS = {"quick": (1, 12), "3": (3, 3), "6": (6, 6), "12": (12, 12)}
 # Rough time to fetch one game with the Riot API rate limit (100 requests per 2 minutes)
 SECONDS_PER_GAME = 1.3
 GOLGG_URL = "https://gol.gg/champion/list/season-S{season}/split-ALL/tournament-ALL/"
+# gol.gg data is stored and downloaded again once it's a day old; pro drafts don't change faster
 PRO_META_TTL = 24 * 60 * 60
 # Pro play counts only from the newest patches; older metas don't apply
 PRO_META_PATCHES = 3
@@ -87,7 +88,7 @@ FLEX_MIN_PICKS = 5
 # times) and our best answers from our pool on that role, by OP.GG's Emerald+ matchup win rate
 THEIR_PICKS = 4
 OUR_ROLE_POOL = 8
-ANSWERS_PER_PICK = 3
+ANSWERS_PER_PICK = 5
 MIN_MATCHUP_GAMES = 100
 # Tags of suggested bans: comfort picks of theirs, champions that beat what we play most (our
 # OUR_MAIN_PICKS per role, scrims counting SCRIM_WEIGHT times), and strong pro-meta champions
@@ -181,7 +182,7 @@ Napisz dokładnie 3 punkty, każdy w jednej linii zaczynającej się od "• ", 
 Bez wstępu, nagłówków i podsumowania. Tylko podane dane, nazwy championów i graczy; przy małych próbkach zaznacz niepewność. Wytyczne drużyny, jeśli są, mają pierwszeństwo."""
 
 _scout_lock = asyncio.Lock()
-_pro_meta_cache: dict[int, tuple[float, dict]] = {}
+_pro_meta_lock = asyncio.Lock()
 _opponents_cache: tuple[float, dict] | None = None
 
 
@@ -382,15 +383,30 @@ async def golgg_page(session: aiohttp.ClientSession, method: str, url: str, **kw
 
 async def fetch_pro_meta(season: int) -> dict:
     """
-    Pro-play champion stats of the season's last PRO_META_PATCHES patches from gol.gg, cached
-    for a day: {"patches", "games", "champions" by champion_key}. gol.gg keeps its filters
-    (patch, role) in its session, so each patch is posted for all roles and then per role.
+    Pro-play champion stats of the season's last PRO_META_PATCHES patches: the copy stored in
+    the database, downloaded again from gol.gg once it's PRO_META_TTL old (the bot's hourly
+    check does that, so a scouting rarely waits for it). When gol.gg fails, the older copy
+    is used, else EMPTY_PRO_META.
     """
-    major = season - SEASON_OFFSET
-    cached = _pro_meta_cache.get(major)
-    if cached and time.time() - cached[0] < PRO_META_TTL:
-        return cached[1]
-    url = GOLGG_URL.format(season=major)
+    async with _pro_meta_lock:
+        stored = await db.get_pro_meta(season)
+        if stored and time.time() - stored["fetched_at"] < PRO_META_TTL:
+            return stored["meta"]
+        meta = await download_pro_meta(season)
+        if not meta:
+            return stored["meta"] if stored else EMPTY_PRO_META
+        await db.save_pro_meta(season, meta, int(time.time()))
+        print(f"Pro meta from gol.gg: patches {', '.join(meta['patches'])} ({meta['games']} games)")
+        return meta
+
+
+async def download_pro_meta(season: int) -> dict | None:
+    """
+    {"patches", "games", "champions" by champion_key} from gol.gg; None when it fails or
+    shows no patches. gol.gg keeps its filters (patch, role) in its session, so each patch
+    is posted for all roles and then per role.
+    """
+    url = GOLGG_URL.format(season=season - SEASON_OFFSET)
     try:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=300), headers={"User-Agent": "LP-Tracker (team Discord bot)"}
@@ -407,13 +423,14 @@ async def fetch_pro_meta(season: int) -> dict:
                         role_tables[GOLGG_ROLES[golgg_role]].append(table)
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         print(f"Could not load pro meta from gol.gg: {e}")
-        return cached[1] if cached else EMPTY_PRO_META
+        return None
+    if not patches:
+        print("Could not load pro meta from gol.gg: no patches on the page")
+        return None
     champions, games = combine_pro_tables(tables, role_tables)
     for stats in champions.values():
         stats["champion"] = display_name(stats["champion"])
-    meta = {"patches": [patch.rstrip(".") for patch in patches], "games": games, "champions": champions}
-    _pro_meta_cache[major] = (time.time(), meta)
-    return meta
+    return {"patches": [patch.rstrip(".") for patch in patches], "games": games, "champions": champions}
 
 
 def scout_rows(match_id: str, match_data: dict, puuids: set[str]) -> list[dict]:
@@ -1647,7 +1664,6 @@ def build_sheet_rows(report: dict) -> tuple[list[list], dict]:
                 (header, len(grid), 0, [kind for _, kind in THEIR_PICK_COLUMNS]),
                 (header, len(grid), BLOCK_STARTS[1], [kind for _, kind in ANSWER_COLUMNS]),
             ]
-
 
     history = report["history"]
     if history["games"]:

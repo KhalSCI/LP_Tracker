@@ -1,4 +1,5 @@
 """Tests for opponent scouting."""
+import time
 from collections import Counter
 from datetime import datetime
 from types import SimpleNamespace
@@ -121,7 +122,7 @@ class TestProMeta:
         assert champions["nunu"]["wr"] is None  # 4 picks, too few for a winrate
 
     async def test_fetch_last_three_patches_with_roles(self, monkeypatch):
-        monkeypatch.setattr(scouting, "_pro_meta_cache", {})
+        await db.init_db()
         monkeypatch.setattr(scouting, "GOLGG_DELAY", 0)
         url = scouting.GOLGG_URL.format(season=16)
         with aioresponses() as mocked:
@@ -130,13 +131,37 @@ class TestProMeta:
                 mocked.post(url, body=GOLGG_HTML)
 
             meta = await scouting.fetch_pro_meta(2026)
+            stored = await scouting.fetch_pro_meta(2026)  # from the database, gol.gg isn't asked again
 
             posts = [call.kwargs["data"] for (method, _), calls in mocked.requests.items() if method == "POST" for call in calls]
+            gets = sum(len(calls) for (method, _), calls in mocked.requests.items() if method == "GET")
         assert meta["patches"] == ["16.20", "16.18", "16.17"] and meta["games"] == 6
         assert posts[:6] == [{"patch": "16.20.", "role": role} for role in ("ALL", "TOP", "JUNGLE", "MID", "ADC", "SUPPORT")]
         assert len(posts) == 18 and posts[6]["patch"] == "16.18."
         assert meta["champions"]["orianna"]["roles"] == {role: 18 for role in ("Top", "Jungle", "Mid", "ADC", "Support")}
-        assert await scouting.fetch_pro_meta(2026) is meta  # cached
+        assert stored == meta and gets == 1
+
+    async def test_stored_copy_refreshed_after_a_day(self, monkeypatch):
+        await db.init_db()
+        monkeypatch.setattr(scouting, "GOLGG_DELAY", 0)
+        monkeypatch.setattr(scouting, "GOLGG_RETRY_DELAY", 0)
+        old = {"patches": ["16.16"], "games": 1, "champions": {}}
+        await db.save_pro_meta(2026, old, int(time.time()) - scouting.PRO_META_TTL - 60)
+        url = scouting.GOLGG_URL.format(season=16)
+
+        with aioresponses() as mocked:
+            for _ in range(scouting.GOLGG_TRIES):
+                mocked.get(url, status=503)
+            assert await scouting.fetch_pro_meta(2026) == old  # gol.gg down: the older copy is better than none
+
+        with aioresponses() as mocked:
+            mocked.get(url, body=GOLGG_HTML)
+            for _ in range(3 * 6):
+                mocked.post(url, body=GOLGG_HTML)
+            meta = await scouting.fetch_pro_meta(2026)
+
+        assert meta["patches"] == ["16.20", "16.18", "16.17"]
+        assert (await db.get_pro_meta(2026))["meta"] == meta
 
     def test_timing_and_roles_combined(self):
         first = {"orianna": {"champion": "Orianna", "picks": 4, "bans": 2, "wins": 2, "losses": 2, "ban_turn": 2.0, "pick_round": 1.5}}
@@ -158,7 +183,7 @@ class TestProMeta:
         assert table["nunu"]["ban_turn"] is None
 
     async def test_dropped_connection_tried_again(self, monkeypatch):
-        monkeypatch.setattr(scouting, "_pro_meta_cache", {})
+        await db.init_db()
         monkeypatch.setattr(scouting, "GOLGG_DELAY", 0)
         monkeypatch.setattr(scouting, "GOLGG_RETRY_DELAY", 0)
         url = scouting.GOLGG_URL.format(season=16)
@@ -174,18 +199,21 @@ class TestProMeta:
         assert meta["patches"] == ["16.20", "16.18", "16.17"] and meta["champions"]["orianna"]["picks"] == 18
 
     async def test_connection_dropped_every_time(self, monkeypatch):
-        monkeypatch.setattr(scouting, "_pro_meta_cache", {})
+        await db.init_db()
         monkeypatch.setattr(scouting, "GOLGG_RETRY_DELAY", 0)
         with aioresponses() as mocked:
             for _ in range(scouting.GOLGG_TRIES):
                 mocked.get(scouting.GOLGG_URL.format(season=16), exception=aiohttp.ServerDisconnectedError())
             assert await scouting.fetch_pro_meta(2026) == scouting.EMPTY_PRO_META
 
-    async def test_unavailable(self, monkeypatch):
-        monkeypatch.setattr(scouting, "_pro_meta_cache", {})
+    async def test_unavailable(self):
+        await db.init_db()
         with aioresponses() as mocked:
             mocked.get(scouting.GOLGG_URL.format(season=16), status=503)
             assert await scouting.fetch_pro_meta(2026) == scouting.EMPTY_PRO_META
+            mocked.get(scouting.GOLGG_URL.format(season=16), body="<html>Cloudflare</html>")
+            assert await scouting.fetch_pro_meta(2026) == scouting.EMPTY_PRO_META  # a page without patches
+        assert await db.get_pro_meta(2026) is None
 
     def test_season(self):
         assert season_of("16.21.712.4512") == 2026
