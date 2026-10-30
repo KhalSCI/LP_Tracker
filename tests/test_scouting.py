@@ -119,20 +119,42 @@ class TestProMeta:
         assert champions["orianna"]["wr"] == 8 / 12
         assert champions["nunu"]["wr"] is None  # 4 picks, too few for a winrate
 
-    async def test_fetch_last_three_patches(self, monkeypatch):
+    async def test_fetch_last_three_patches_with_roles(self, monkeypatch):
         monkeypatch.setattr(scouting, "_pro_meta_cache", {})
+        monkeypatch.setattr(scouting, "GOLGG_DELAY", 0)
         url = scouting.GOLGG_URL.format(season=16)
         with aioresponses() as mocked:
             mocked.get(url, body=GOLGG_HTML)
-            for _ in range(3):
+            for _ in range(3 * 6):
                 mocked.post(url, body=GOLGG_HTML)
 
             meta = await scouting.fetch_pro_meta(2026)
 
             posts = [call.kwargs["data"] for (method, _), calls in mocked.requests.items() if method == "POST" for call in calls]
         assert meta["patches"] == ["16.20", "16.18", "16.17"] and meta["games"] == 6
-        assert posts == [{"patch": "16.20."}, {"patch": "16.18."}, {"patch": "16.17."}]
+        assert posts[:6] == [{"patch": "16.20.", "role": role} for role in ("ALL", "TOP", "JUNGLE", "MID", "ADC", "SUPPORT")]
+        assert len(posts) == 18 and posts[6]["patch"] == "16.18."
+        assert meta["champions"]["orianna"]["roles"] == {role: 18 for role in ("Top", "Jungle", "Mid", "ADC", "Support")}
         assert await scouting.fetch_pro_meta(2026) is meta  # cached
+
+    def test_timing_and_roles_combined(self):
+        first = {"orianna": {"champion": "Orianna", "picks": 4, "bans": 2, "wins": 2, "losses": 2, "ban_turn": 2.0, "pick_round": 1.5}}
+        second = {"orianna": {"champion": "Orianna", "picks": 6, "bans": 6, "wins": 4, "losses": 2, "ban_turn": 4.0, "pick_round": 2.0}}
+        roles = {"Mid": [{"orianna": {"champion": "Orianna", "picks": 8}}], "Top": [{"orianna": {"champion": "Orianna", "picks": 2}}]}
+
+        champions, games = combine_pro_tables([first, second], roles)
+
+        orianna = champions["orianna"]
+        assert games == 1 and orianna["ban_turn"] == (2 * 2 + 4 * 6) / 8 and orianna["pick_round"] == (1.5 * 4 + 2 * 6) / 10
+        assert orianna["roles"] == {"Mid": 8, "Top": 2} and scouting.flex_roles(orianna["roles"]) == ["Mid", "Top"]
+
+    def test_table_with_timing_columns(self):
+        html = GOLGG_HTML.replace("<th>Winrate</th>", "<th>Winrate</th><th>Avg BT</th><th>Avg RP</th>")
+        html = html.replace("<td>67%</td></tr>", "<td>67%</td><td>2.5</td><td>1.40</td></tr>")
+        html = html.replace("<td>50%</td></tr>", "<td>50%</td><td>-</td><td>2.00</td></tr>")
+        table = parse_champion_table(html)
+        assert (table["orianna"]["ban_turn"], table["orianna"]["pick_round"]) == (2.5, 1.4)
+        assert table["nunu"]["ban_turn"] is None
 
     async def test_unavailable(self, monkeypatch):
         monkeypatch.setattr(scouting, "_pro_meta_cache", {})
@@ -144,6 +166,63 @@ class TestProMeta:
         assert season_of("16.21.712.4512") == 2026
         assert season_of("15.24.1.1") == 2025
         assert season_of("") is None
+
+
+class TestDraftContext:
+    """Test cases for what the draft plan's model gets."""
+
+    def test_meta_facts(self):
+        meta = {
+            "nocturne": {"champion": "Nocturne", "picks": 50, "bans": 300, "presence": 0.76, "wr": 0.5,
+                         "ban_turn": 3.8, "pick_round": 2.1, "roles": {"Jungle": 50}},
+            "rumble": {"champion": "Rumble", "picks": 40, "bans": 20, "presence": 0.44, "wr": None,
+                       "ban_turn": None, "pick_round": 1.6, "roles": {"Top": 20, "Jungle": 12, "Mid": 8}},
+        }
+        lines = scouting.meta_facts(report_with([], pro_meta=meta))
+
+        assert lines[1] == "- Nocturne [Jungle]: P+B 76%, WR 50%, śr. tura bana 3.8, śr. runda picku 2.1"
+        assert lines[2] == "- Rumble [Top/Jungle/Mid]: P+B 44%, WR -, śr. tura bana -, śr. runda picku 1.6"
+        assert "Najczęstsze picki pro na Jungle: Nocturne 50, Rumble 12" in lines
+        assert lines[-1] == "Flex picki pro: Rumble (Top/Jungle/Mid)"
+        assert scouting.meta_facts(report_with([])) == []
+
+    def test_guide_file(self, tmp_path, monkeypatch):
+        guide = tmp_path / "draft_guide.md"
+        monkeypatch.setattr(scouting, "DRAFT_GUIDE", guide)
+        assert scouting.draft_guide() == "" and "Wytyczne drużyny:" not in scouting.draft_system_prompt()
+
+        guide.write_text("  Banujemy pod gracza.\n", encoding="utf-8")
+        assert scouting.draft_system_prompt().endswith("Wytyczne drużyny:\nBanujemy pod gracza.")
+
+    async def test_our_team(self, monkeypatch):
+        import team_games
+        monkeypatch.setattr(scouting, "GOOGLE_SHEET_ID", "sheet")
+        monkeypatch.setattr(team_games, "load_team_roster", AsyncMock(return_value=team_games.TeamRoster([
+            {"riot_id": "Mid#EUW", "nick": "iym", "role": "Mid", "puuid": "m"},
+            {"riot_id": "Top#EUW", "nick": "drewin", "role": "Top", "puuid": "t"},
+            {"riot_id": "Old#EUW", "nick": "ex", "role": None, "puuid": "o"},
+        ])))
+        monkeypatch.setattr(scouting.team_sheet, "read_roster_cached", AsyncMock(return_value=[
+            {"riot_id": "Mid#EUW", "status": "Main"}, {"riot_id": "Top#EUW", "status": "Próba"}]))
+        soloq = [{"puuid": "m", "queue_id": 420, "remake": False, "champion_name": "Ahri", "win": w} for w in (1, 1, 0)]
+        soloq.append({"puuid": "m", "queue_id": 440, "remake": False, "champion_name": "Zed", "win": 1})
+        monkeypatch.setattr(scouting.db, "get_matches_since", AsyncMock(return_value=soloq))
+        monkeypatch.setattr(scouting.db, "get_team_game_stats", AsyncMock(return_value=[
+            {"ours": True, "player": "drewin", "champion": "Aatrox", "win": True},
+            {"ours": False, "player": "E#1", "champion": "Jax", "win": False}]))
+
+        lines = await scouting.our_team_facts(NOW * 1000)
+
+        assert lines == [
+            "Nasza drużyna (role ze Składu):",
+            "- Top drewin (Próba): SoloQ 30 dni: brak; scrimy i oficjale: Aatrox 1 (100%)",
+            "- Mid iym (Main): SoloQ 30 dni: Ahri 3 (67%); scrimy i oficjale: brak",
+        ]
+
+    def test_embed_summary(self):
+        assert scouting.embed_summary("### Bany\n• Viktor") == "**Bany**\n• Viktor"
+        assert scouting.embed_summary("x" * 50, limit=10) == "x" * 9 + "…"
+        assert scouting.embed_summary(None) is None
 
 
 class TestSummarize:
@@ -338,8 +417,14 @@ class TestSheetRows:
         assert rows[header + 1][18:20] == ["Gnar", 1]
         assert rows[-1][0] == "X#1: ⚠ Nie znaleziono konta"
         assert 3 in layout["sections"] and rows.index(band) in layout["bands"]
+        assert ["• banujcie Camille"] == [row[0] for row in rows if row[0].startswith("•")]
         assert (4, 6, 0) in [t[:3] for t in layout["tables"]]
         assert [t[2] for t in layout["tables"] if t[0] == header] == [0, 9, 18]
+
+    def test_summary_headings_are_bold_rows(self):
+        rows, layout = build_sheet_rows(report_with([], summary="### Bany – faza 1\n• **Viktor**: komfort"))
+        heading = next(i for i, row in enumerate(rows) if row[0] == "Bany – faza 1")
+        assert heading in layout["labels"] and rows[heading + 1][0] == "• Viktor: komfort"
 
     def test_merged_player_band(self):
         euw, eune = account("Sredni#pit", tier="MASTER"), account("Lumino#INT", "eun1", "DIAMOND")
@@ -355,13 +440,16 @@ class TestSheetRows:
         assert "EUNE: Diamond I 50 LP, 10-10 (50%) · SoloQ nie liczę, konto EUNE poniżej Mastera" in embed.fields[0].value
 
     def test_pro_meta_block(self):
-        meta = {"orianna": {"champion": "Orianna", "picks": 20, "bans": 30, "presence": 0.5, "wr": 0.55},
-                "ahri": {"champion": "Ahri", "picks": 10, "bans": 5, "presence": 0.15, "wr": None}}
+        meta = {"orianna": {"champion": "Orianna", "picks": 20, "bans": 30, "presence": 0.5, "wr": 0.55,
+                            "ban_turn": 2.44, "pick_round": 1.31, "roles": {"Mid": 20}},
+                "ahri": {"champion": "Ahri", "picks": 10, "bans": 5, "presence": 0.15, "wr": None,
+                         "ban_turn": None, "pick_round": None, "roles": {}}}
         rows, layout = build_sheet_rows(report_with([], pro_meta=meta))
 
         title = next(i for i, row in enumerate(rows) if row[0].startswith("Meta pro"))
         assert rows[title][0].startswith("Meta pro (gol.gg, patche 16.20, 16.18, 16.17, 1000 gier)")
-        assert rows[title + 2][:5] == ["Orianna", 20, 30, 0.5, 0.55] and rows[title + 3][:5] == ["Ahri", 10, 5, 0.15, ""]
+        assert rows[title + 2][:8] == ["Orianna", 20, 30, 0.5, 0.55, 2.4, 1.3, "Mid"]
+        assert rows[title + 3][:8] == ["Ahri", 10, 5, 0.15, "", "", "", "?"]
         assert title in layout["sections"]
 
     def test_format_requests(self):

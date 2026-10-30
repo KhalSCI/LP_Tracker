@@ -32,7 +32,8 @@ h1 { margin:0 0 4px; font-size:28px; } h1 span { color:var(--accent); }
 h2 { font-size:18px; margin:34px 0 12px; padding-bottom:6px; border-bottom:1px solid var(--border); }
 .meta { color:var(--muted); font-size:13px; }
 .card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:14px 16px; }
-.summary ul { margin:0; padding-left:18px; } .summary li { margin:4px 0; }
+.summary ul { margin:0 0 6px; padding-left:18px; } .summary li { margin:4px 0; }
+.summary h3 { font-size:15px; margin:14px 0 4px; color:var(--accent); } .summary h3:first-child { margin-top:0; }
 .icon { width:28px; height:28px; border-radius:6px; vertical-align:middle; background:var(--surface2); flex:none; }
 .icon.big { width:44px; height:44px; border-radius:8px; }
 .bans { display:grid; grid-template-columns:repeat(auto-fill,minmax(225px,1fr)); gap:10px; }
@@ -107,6 +108,31 @@ def inline_markdown(text: str) -> str:
     return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escape(text))
 
 
+def render_summary(summary: str) -> str:
+    """The draft plan: "### " lines as headings, "• " lines as list items, the rest as paragraphs."""
+    parts, items = [], []
+
+    def close_list():
+        if items:
+            parts.append("<ul>" + "".join(f"<li>{item}</li>" for item in items) + "</ul>")
+            items.clear()
+
+    for line in summary.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            close_list()
+            parts.append(f"<h3>{inline_markdown(line.lstrip('#').strip())}</h3>")
+        elif line[0] in "•-*" and line[1:2] == " ":
+            items.append(inline_markdown(line[2:].strip()))
+        else:
+            close_list()
+            parts.append(f"<p>{inline_markdown(line)}</p>")
+    close_list()
+    return "".join(parts)
+
+
 def page(title: str, body: str) -> str:
     return (
         "<!doctype html><html lang=\"pl\"><head><meta charset=\"utf-8\">"
@@ -175,11 +201,26 @@ def ban_card(ban: dict) -> str:
     if ban["tourney_games"]:
         lines += f'<div class="line"><span class="lbl">Turnieje</span>{games_count(ban["tourney_games"])} · {wr_cell(ban["tourney_wr"])}</div>'
     if ban["pro_presence"] is not None:
-        lines += f'<div class="line"><span class="lbl">Pro P+B</span>{scouting.pct(ban["pro_presence"])}</div>'
+        turn = f' · tura bana ~{ban["pro_ban_turn"]:.0f}' if ban.get("pro_ban_turn") else ""
+        lines += f'<div class="line"><span class="lbl">Pro P+B</span>{scouting.pct(ban["pro_presence"])}{turn}</div>'
     return (
         f'<div class="card ban">{icon(ban["champion"], big=True)}<div><b>{escape(ban["champion"])}</b>'
         f'<span class="who">{escape(ban["player"])} · {escape(ban["role"] or "?")}</span>{lines}</div></div>'
     )
+
+
+def pro_timing(champion: dict) -> str:
+    """"tura bana ~2 · runda picku 1,3": average pro ban turn and pick round."""
+    parts = []
+    if champion.get("ban_turn"):
+        parts.append(f"tura bana ~{champion['ban_turn']:.0f}")
+    if champion.get("pick_round"):
+        parts.append(f"runda picku {decimal(champion['pick_round'], 1)}")
+    return " · ".join(parts)
+
+
+def pro_details(champion: dict) -> str:
+    return f"{champion['picks']} picków, {champion['bans']} banów"
 
 
 def chips(counter, label: str) -> str:
@@ -202,10 +243,7 @@ def render_report(report: dict, index_url: str = "") -> str:
     body = f'<h1>Scouting: <span>{escape(report["team"])}</span></h1><p class="meta">{meta}</p>'
 
     if report["summary"]:
-        items = "".join(
-            f"<li>{inline_markdown(line.strip().lstrip('•').strip())}</li>" for line in report["summary"].splitlines() if line.strip()
-        )
-        body += f'<h2>Podsumowanie</h2><section class="card summary"><ul>{items}</ul></section>'
+        body += f'<h2>Plan draftu</h2><section class="card summary">{render_summary(report["summary"])}</section>'
 
     body += "<h2>Sugerowane bany</h2>"
     body += (f'<section class="bans">{"".join(ban_card(b) for b in report["bans"])}</section>' if report["bans"]
@@ -224,9 +262,11 @@ def render_report(report: dict, index_url: str = "") -> str:
     if report["pro_meta"]:
         top = sorted(report["pro_meta"].values(), key=lambda c: -(c["presence"] or 0))[:PRO_CHAMPIONS]
         rows = "".join(
-            f'<div class="row">{icon(c["champion"])}<span style="min-width:96px">{escape(c["champion"])}</span>'
+            f'<div class="row" title="{escape(pro_details(c))}">{icon(c["champion"])}<span style="min-width:96px">{escape(c["champion"])}'
+            f'<br><small class="meta">{escape(scouting.role_list(c.get("roles") or {}))}</small></span>'
             f'<span class="bar"><i style="width:{round((c["presence"] or 0) * 100)}%"></i></span>'
-            f'<span class="num">{scouting.pct(c["presence"])} P+B{" · " + scouting.pct(c["wr"]) + " WR" if c["wr"] is not None else ""}</span></div>'
+            f'<span class="num">{scouting.pct(c["presence"])} P+B{" · " + scouting.pct(c["wr"]) + " WR" if c["wr"] is not None else ""}'
+            f'<br>{escape(pro_timing(c))}</span></div>'
             for c in top
         )
         body += (f'<h2>Meta pro: obecność w draftach (pick + ban)</h2><p class="meta">gol.gg, patche '

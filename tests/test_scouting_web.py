@@ -49,6 +49,11 @@ class TestRender:
         assert "Przeciwko nam" in page and "Camille ×2" in page
         assert "Meta pro" in page and "33% P+B · 53% WR" in page
 
+    def test_draft_plan_sections(self):
+        html = scouting_web.render_summary("### Bany – faza 1\n• **Viktor** — komfort\n• Wukong\n### Plan\nNa blue: <B1>")
+        assert html == ("<h3>Bany – faza 1</h3><ul><li><strong>Viktor</strong> — komfort</li><li>Wukong</li></ul>"
+                        "<h3>Plan</h3><p>Na blue: &lt;B1&gt;</p>")
+
     def test_unknown_champion_gets_an_empty_icon(self):
         assert scouting_web.icon("Nowy Champion") == '<span class="icon"></span>'
 

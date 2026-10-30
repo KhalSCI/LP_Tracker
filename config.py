@@ -39,6 +39,9 @@ CHAT_REPLIES_PER_DAY = int(os.getenv("CHAT_REPLIES_PER_DAY", 30))
 
 # Opponent scouting: default period of ranked and tournament-code games, in months (/scout offers 3, 6, 12)
 SCOUT_MONTHS = int(os.getenv("SCOUT_MONTHS", 6))
+# The draft plan in scouting reports uses a stronger model than the game comments (it's rare) with some thinking
+SCOUT_MODEL = os.getenv("SCOUT_MODEL", "anthropic/claude-sonnet-5.5")
+SCOUT_REASONING = os.getenv("SCOUT_REASONING", "medium")
 
 # Scouting reports as HTML pages: folder a web server serves and its public URL (both empty = off)
 SCOUTING_WEB_DIR = os.getenv("SCOUTING_WEB_DIR", "")

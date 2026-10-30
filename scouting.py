@@ -13,6 +13,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime
 from html.parser import HTMLParser
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
 import aiohttp
@@ -23,7 +24,7 @@ import database as db
 import llm
 from champions import champions
 from cogs.sheet import format_tier, APEX_TIERS, SOLOQ_QUEUE
-from config import TIMEZONE, SCOUT_MONTHS, GOOGLE_SHEET_ID
+from config import TIMEZONE, SCOUT_MONTHS, SCOUT_MODEL, SCOUT_REASONING, GOOGLE_SHEET_ID
 from riot_api import riot_api, RiotAPIError
 from roasts import plural, games_count
 from sheet_format import BAND_BACKGROUND, GRAY, grid_range, cell_format, table_format, column_widths
@@ -71,12 +72,28 @@ PRO_META_PATCHES = 3
 MIN_PRO_PICKS_FOR_WR = 5
 PRO_META_ROWS = 20
 EMPTY_PRO_META = {"patches": [], "games": 0, "champions": {}}
+# gol.gg's role filter values; each patch is read once for all roles and once per role
+GOLGG_ROLES = {"TOP": "Top", "JUNGLE": "Jungle", "MID": "Mid", "ADC": "ADC", "SUPPORT": "Support"}
+GOLGG_DELAY = 0.5
+# A champion is a flex pick when another role has at least this share of its pro picks
+FLEX_SHARE = 0.2
+FLEX_MIN_PICKS = 5
+# Draft plan context: pro-meta champions given to the model, and our players' pools
+META_FACTS_CHAMPIONS = 25
+META_ROLE_PICKS = 6
+OUR_POOL_DAYS = 30
+OUR_POOL_CHAMPIONS = 6
+# The team's own draft knowledge for the model, kept out of git (draft_guide.example.md is a template
+# to copy; it isn't used itself, as models take its placeholder examples for facts)
+DRAFT_GUIDE = Path(__file__).parent / "draft_guide.md"
 # Champions per player shown in the sheet, and in the embed (fewer when the embed gets too long)
 SHEET_CHAMPIONS = 10
 EMBED_CHAMPIONS = (4, 3, 2)
 # Discord rejects embeds over 6000 characters
 EMBED_MAX_LENGTH = 5900
-BAN_SUGGESTIONS = 5
+BAN_SUGGESTIONS = 10
+# The embed shows only the first ones; the page and the sheet show all
+EMBED_BANS = 6
 # Ranked games in the period (or tournament games) a champion needs to be suggested as a ban
 MIN_BAN_GAMES = 5
 MIN_BAN_TOURNEY_GAMES = 2
@@ -121,17 +138,35 @@ BLOCK_COLUMNS = [("Champion", "name"), ("Gry", "int"), ("W", "int"), ("L", "int"
                  ("Pro P+B", "pct"), ("Pro WR", "pct")]
 BAN_COLUMNS = [("Champion", "name"), ("SoloQ gry", "int"), ("SoloQ WR", "wr"), ("Turnieje gry", "int"),
                ("Turnieje WR", "wr"), ("Pro P+B", "pct"), ("Pro WR", "pct"), ("Rola", "text"), ("Gracz", "text")]
-PRO_COLUMNS = [("Champion", "name"), ("Picki", "int"), ("Bany", "int"), ("P+B", "pct"), ("WR", "pct")]
+PRO_COLUMNS = [("Champion", "name"), ("Picki", "int"), ("Bany", "int"), ("P+B", "pct"), ("WR", "pct"),
+               ("Śr. tura bana", "dec1"), ("Śr. runda picku", "dec1"), ("Role", "text")]
 SHEET_COLS = 26
 COLUMN_WIDTHS = {start: 130 for start in BLOCK_STARTS}
 DEFAULT_WIDTH = 62
 
-SUMMARY_PROMPT = """Jesteś analitykiem draftu w uczelnianej drużynie League of Legends.
-Dostajesz dane o drużynie przeciwnika: pule championów graczy z rankedów z ostatnich miesięcy, gry turniejowe, sugerowane bany i obecność championów w draftach gry profesjonalnej z ostatnich patchy.
-Gracz może mieć dwa konta (EUW i EUNE); wtedy jego gry są już zsumowane.
-Napisz po polsku 3-5 krótkich punktów do przygotowania draftu: co banować, na kim się skupić, comfort picki i one-tricki, na co uważać.
-Wyraźnie rozróżniaj gry z SoloQ i turniejowe (kody turniejowe): turniejowe lepiej pokazują, co grają w meczach drużynowych.
-Opieraj się wyłącznie na podanych danych, nie wymyślaj. Każdy punkt w osobnej linii zaczynającej się od "• ", razem najwyżej 700 znaków."""
+DRAFT_PROMPT = """Jesteś analitykiem draftu uczelnianej drużyny League of Legends i przygotowujesz plan draftu na mecz z przeciwnikiem.
+Dostajesz:
+1. Graczy przeciwnika: rangi, pule championów z SoloQ i osobno z gier turniejowych (kody turniejowe; lepiej pokazują, co grają w meczach drużynowych). Gracz może mieć kilka kont, jego gry są już zsumowane.
+2. Sugestie banów policzone z danych (komforty: liczba gier i winrate).
+3. Naszą drużynę: pule z SoloQ z ostatniego miesiąca oraz ze scrimów i oficjali.
+4. Metę z gry profesjonalnej z ostatnich patchy (gol.gg): obecność w draftach (pick + ban na grę), winrate, średnią turę bana (1 = pierwszy ban), średnią rundę picku (bliżej 1 = wcześniej w drafcie), role i flex picki.
+5. Wytyczne drużyny od kapitana: mają pierwszeństwo przed ogólnymi zasadami.
+
+Draft turniejowy: faza 1 to po 3 bany i picki B1, R1-R2, B2-B3, R3; faza 2 to po 2 bany (red banuje pierwszy) i picki R4, B4-B5, R5. Champions z wczesną rundą picku w pro to bezpieczne, priorytetowe picki na początek draftu; te z późną to zwykle kontry na ostatnie picki. Bany fazy 1 celują w komforty przeciwnika potwierdzone w turniejach i w najmocniejsze picki mety; bany fazy 2 chronią nasz skład i celują w rolę, którą przeciwnik jeszcze wybiera. Flex picki chowają rolę do końca draftu.
+
+Opieraj się wyłącznie na podanych danych i nie wymyślaj statystyk. Przy małych próbkach (1-3 gry) zaznacz niepewność. Pisz po polsku, konkretnie, nazwami championów i graczy.
+Odpowiedz tylko tymi sekcjami, nagłówki zaczynaj od "### ", punkty od "• ":
+### Kluczowi gracze
+### Bany – faza 1
+(3-5 propozycji, każda z uzasadnieniem z danych)
+### Bany – faza 2
+(warunkowo, np. jeśli wezmą X, jeśli my weźmiemy Y)
+### Nasze picki
+(co brać wcześnie z naszej puli w tej mecie, co zostawić na kontrę)
+### Na co uważać
+(ich flex picki, późne kontry, one-tricki)
+### Plan na blue i red
+Razem najwyżej około 2500 znaków."""
 
 _scout_lock = asyncio.Lock()
 _pro_meta_cache: dict[int, tuple[float, dict]] = {}
@@ -189,6 +224,12 @@ def pct(value: float | None) -> str:
     return f"{round(value * 100)}%" if value is not None else ""
 
 
+def display_name(name: str) -> str:
+    """gol.gg's champion name as Data Dragon writes it: "KSante" -> "K'Sante"."""
+    key = champion_key(name)
+    return next((n for n in champions.names if champion_key(n) == key), name)
+
+
 def champion_key(name: str) -> str:
     key = re.sub(r"[^a-z0-9]", "", name.lower())
     return CHAMPION_ALIASES.get(key, key)
@@ -236,8 +277,18 @@ def parse_patches(html: str) -> list[str]:
     return list(dict.fromkeys(re.findall(r"<option value='(\d[\d.]*)'", select.group(0)))) if select else []
 
 
+def parse_number(text: str) -> float | None:
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_champion_table(html: str) -> dict[str, dict]:
-    """gol.gg champion stats by champion_key: picks, bans, wins and losses."""
+    """
+    gol.gg champion stats by champion_key: picks, bans, wins, losses, and when the table
+    has them the average ban turn (1 = first ban) and pick round.
+    """
     parser = _ChampionTableParser()
     parser.feed(html)
     if not parser.rows:
@@ -248,26 +299,44 @@ def parse_champion_table(html: str) -> dict[str, dict]:
         print(f"gol.gg champion table has unexpected columns: {header}")
         return {}
     column = {name: header.index(name) for name in needed}
-    return {
-        champion_key(row[column["Champion"]]): {
-            "champion": row[column["Champion"]],
-            **{name.lower(): int(re.sub(r"\D", "", row[column[name]]) or 0) for name in needed[1:]},
-        }
-        for row in parser.rows[1:] if len(row) >= len(header)
-    }
+    optional = {key: header.index(name) for name, key in (("Avg BT", "ban_turn"), ("Avg RP", "pick_round")) if name in header}
+    table = {}
+    for row in parser.rows[1:]:
+        if len(row) < len(header):
+            continue
+        stats = {"champion": row[column["Champion"]]}
+        stats.update({name.lower(): int(re.sub(r"\D", "", row[column[name]]) or 0) for name in needed[1:]})
+        stats.update({key: parse_number(row[i]) for key, i in optional.items()})
+        table[champion_key(stats["champion"])] = stats
+    return table
 
 
-def combine_pro_tables(tables: list[dict]) -> tuple[dict[str, dict], int]:
+def combine_pro_tables(tables: list[dict], role_tables: dict[str, list[dict]] = None) -> tuple[dict[str, dict], int]:
     """
-    Champion stats summed over patches, with presence (picks and bans per game) and winrate
-    (from MIN_PRO_PICKS_FOR_WR picks), and the number of games (ten picks each).
+    Champion stats summed over patches: presence (picks and bans per game), winrate (from
+    MIN_PRO_PICKS_FOR_WR picks), average ban turn and pick round (weighted by bans and
+    picks), and picks per role from role_tables (role -> one table per patch). Also the
+    number of games (ten picks each).
     """
     totals = {}
     for table in tables:
         for key, stats in table.items():
-            total = totals.setdefault(key, {"champion": stats["champion"], "picks": 0, "bans": 0, "wins": 0, "losses": 0})
+            total = totals.setdefault(key, {"champion": stats["champion"], "picks": 0, "bans": 0, "wins": 0, "losses": 0,
+                                            "turn_sum": 0.0, "turn_bans": 0, "round_sum": 0.0, "round_picks": 0})
             for name in ("picks", "bans", "wins", "losses"):
                 total[name] += stats[name]
+            if stats.get("ban_turn") is not None and stats["bans"]:
+                total["turn_sum"] += stats["ban_turn"] * stats["bans"]
+                total["turn_bans"] += stats["bans"]
+            if stats.get("pick_round") is not None and stats["picks"]:
+                total["round_sum"] += stats["pick_round"] * stats["picks"]
+                total["round_picks"] += stats["picks"]
+    roles = defaultdict(Counter)
+    for role, role_patches in (role_tables or {}).items():
+        for table in role_patches:
+            for key, stats in table.items():
+                if stats["picks"]:
+                    roles[key][role] += stats["picks"]
     games = sum(total["picks"] for total in totals.values()) // 10
     champions = {
         key: {
@@ -276,6 +345,9 @@ def combine_pro_tables(tables: list[dict]) -> tuple[dict[str, dict], int]:
             "bans": t["bans"],
             "presence": (t["picks"] + t["bans"]) / games if games else None,
             "wr": t["wins"] / (t["wins"] + t["losses"]) if t["picks"] >= MIN_PRO_PICKS_FOR_WR and t["wins"] + t["losses"] else None,
+            "ban_turn": t["turn_sum"] / t["turn_bans"] if t["turn_bans"] else None,
+            "pick_round": t["round_sum"] / t["round_picks"] if t["round_picks"] else None,
+            "roles": dict(roles[key].most_common()),
         }
         for key, t in totals.items()
     }
@@ -285,8 +357,8 @@ def combine_pro_tables(tables: list[dict]) -> tuple[dict[str, dict], int]:
 async def fetch_pro_meta(season: int) -> dict:
     """
     Pro-play champion stats of the season's last PRO_META_PATCHES patches from gol.gg, cached
-    for a day: {"patches", "games", "champions" by champion_key}. gol.gg keeps the patch
-    filter in its session, so the patches are posted one by one in one session.
+    for a day: {"patches", "games", "champions" by champion_key}. gol.gg keeps its filters
+    (patch, role) in its session, so each patch is posted for all roles and then per role.
     """
     major = season - SEASON_OFFSET
     cached = _pro_meta_cache.get(major)
@@ -295,20 +367,28 @@ async def fetch_pro_meta(season: int) -> dict:
     url = GOLGG_URL.format(season=major)
     try:
         async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=120), headers={"User-Agent": "LP-Tracker (team Discord bot)"}
+            timeout=aiohttp.ClientTimeout(total=300), headers={"User-Agent": "LP-Tracker (team Discord bot)"}
         ) as session:
             async with session.get(url) as response:
                 response.raise_for_status()
                 patches = parse_patches(await response.text())[:PRO_META_PATCHES]
-            tables = []
+            tables, role_tables = [], defaultdict(list)
             for patch in patches:
-                async with session.post(url, data={"patch": patch}) as response:
-                    response.raise_for_status()
-                    tables.append(parse_champion_table(await response.text()))
+                for golgg_role in ("ALL", *GOLGG_ROLES):
+                    await asyncio.sleep(GOLGG_DELAY)
+                    async with session.post(url, data={"patch": patch, "role": golgg_role}) as response:
+                        response.raise_for_status()
+                        table = parse_champion_table(await response.text())
+                    if golgg_role == "ALL":
+                        tables.append(table)
+                    else:
+                        role_tables[GOLGG_ROLES[golgg_role]].append(table)
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         print(f"Could not load pro meta from gol.gg: {e}")
         return cached[1] if cached else EMPTY_PRO_META
-    champions, games = combine_pro_tables(tables)
+    champions, games = combine_pro_tables(tables, role_tables)
+    for stats in champions.values():
+        stats["champion"] = display_name(stats["champion"])
     meta = {"patches": [patch.rstrip(".") for patch in patches], "games": games, "champions": champions}
     _pro_meta_cache[major] = (time.time(), meta)
     return meta
@@ -414,6 +494,8 @@ def champion_table(games: list[dict], pro_meta: dict) -> list[dict]:
             "wr": s["wins"] / s["games"],
             "kda": round((s["kills"] + s["assists"]) / max(s["deaths"], 1), 2),
             "pro_presence": pro.get("presence"),
+            "pro_ban_turn": pro.get("ban_turn"),
+            "pro_pick_round": pro.get("pick_round"),
             "pro_wr": pro.get("wr"),
         })
     return sorted(table, key=lambda c: (-c["games"], -c["wins"], c["champion"]))
@@ -791,6 +873,7 @@ def ban_suggestions(players: list[dict]) -> list[dict]:
                 "tourney_games": t["games"] if t else 0,
                 "tourney_wr": t["wr"] if t else None,
                 "pro_presence": (r or t)["pro_presence"],
+                "pro_ban_turn": (r or t)["pro_ban_turn"],
                 "pro_wr": (r or t)["pro_wr"],
             })
     suggestions, seen = [], set()
@@ -970,6 +1053,92 @@ def pool_text(table: list[dict], count: int) -> str:
     return ", ".join(f"{c['champion']} {games_count(c['games'])} {pct(c['wr'])}" for c in table[:count]) or "brak"
 
 
+def role_list(roles: dict[str, int]) -> str:
+    return "/".join(roles) or "?"
+
+
+def flex_roles(roles: dict[str, int]) -> list[str]:
+    """Roles with at least FLEX_SHARE of a champion's pro picks, when it has a few."""
+    total = sum(roles.values())
+    if total < FLEX_MIN_PICKS:
+        return []
+    return [role for role, picks in roles.items() if picks / total >= FLEX_SHARE]
+
+
+def meta_facts(report: dict) -> list[str]:
+    """Pro draft context for the model: priority champions, typical picks per role, flex picks."""
+    champions = report["pro_meta"]
+    if not champions:
+        return []
+    def number(value):
+        return f"{value:.1f}" if value is not None else "-"
+    top = sorted(champions.values(), key=lambda c: -(c["presence"] or 0))[:META_FACTS_CHAMPIONS]
+    lines = [
+        f"Meta pro (gol.gg, patche {', '.join(report['pro_patches'])}, {report['pro_games']} gier), "
+        "najwyższa obecność w draftach:",
+        *(f"- {c['champion']} [{role_list(c['roles'])}]: P+B {pct(c['presence'])}, WR {pct(c['wr']) or '-'}, "
+          f"śr. tura bana {number(c['ban_turn'])}, śr. runda picku {number(c['pick_round'])}" for c in top),
+    ]
+    for role in ROLES:
+        picked = sorted((c for c in champions.values() if c["roles"].get(role)), key=lambda c: -c["roles"][role])
+        lines.append(f"Najczęstsze picki pro na {role}: " + ", ".join(
+            f"{c['champion']} {c['roles'][role]}" for c in picked[:META_ROLE_PICKS]))
+    flex = [c for c in champions.values() if len(flex_roles(c["roles"])) > 1]
+    flex.sort(key=lambda c: -c["picks"])
+    if flex:
+        lines.append("Flex picki pro: " + ", ".join(f"{c['champion']} ({'/'.join(flex_roles(c['roles']))})" for c in flex[:12]))
+    return lines
+
+
+def champion_counts(games: list[tuple[str, bool]], count: int) -> str:
+    """"Camille 12 (58%), Jax 5 (40%)" from (champion, win) pairs, most played first."""
+    played = defaultdict(lambda: [0, 0])
+    for champion, win in games:
+        played[champion][0] += 1
+        played[champion][1] += bool(win)
+    ordered = sorted(played.items(), key=lambda item: (-item[1][0], -item[1][1]))
+    return ", ".join(f"{champion} {n} ({round(wins / n * 100)}%)" for champion, (n, wins) in ordered[:count]) or "brak"
+
+
+async def our_team_facts(now_ms: int) -> list[str]:
+    """Our roster's pools for the model: SoloQ of the last OUR_POOL_DAYS days, scrims and officials."""
+    if not GOOGLE_SHEET_ID:
+        return []
+    from team_games import load_team_roster  # team_games is only needed here
+    try:
+        roster = await load_team_roster()
+        statuses = {row["riot_id"].lower(): row["status"] for row in await team_sheet.read_roster_cached()}
+    except Exception as e:
+        print(f"Scouting: could not read our roster: {e}")
+        return []
+    members = [m for m in roster.members if m.get("role") and m["riot_id"].lower() in statuses]
+    members.sort(key=lambda m: ROLES.index(m["role"]))
+    soloq = await db.get_matches_since([m["puuid"] for m in members if m.get("puuid")], now_ms - OUR_POOL_DAYS * DAY_MS)
+    team_rows = [r for r in await db.get_team_game_stats() if r["ours"]]
+    lines = ["Nasza drużyna (role ze Składu):"]
+    for member in members:
+        solo = [(champions.name(champion_key=g["champion_name"]), g["win"]) for g in soloq
+                if g["puuid"] == member["puuid"] and g["queue_id"] == SOLOQ_QUEUE and not g["remake"]]
+        team = [(r["champion"], r["win"]) for r in team_rows if r["player"] == member["nick"]]
+        lines.append(
+            f"- {member['role']} {member['nick']} ({statuses[member['riot_id'].lower()] or 'skład'}): "
+            f"SoloQ {OUR_POOL_DAYS} dni: {champion_counts(solo, OUR_POOL_CHAMPIONS)}; "
+            f"scrimy i oficjale: {champion_counts(team, OUR_POOL_CHAMPIONS)}"
+        )
+    return lines
+
+
+def draft_guide(path: Path = None) -> str:
+    """The team's draft guide (draft_guide.md), empty when there's none."""
+    path = path or DRAFT_GUIDE
+    return path.read_text(encoding="utf-8").strip() if path.exists() else ""
+
+
+def draft_system_prompt() -> str:
+    guide = draft_guide()
+    return DRAFT_PROMPT + (f"\n\nWytyczne drużyny:\n{guide}" if guide else "")
+
+
 def summary_facts(report: dict) -> str:
     """The report as compact text for the model."""
     lines = [f"Drużyna przeciwnika: {report['team']}"]
@@ -998,12 +1167,8 @@ def summary_facts(report: dict) -> str:
             f"grali: {', '.join(c for c, _ in history['picks'].most_common(8))}; "
             f"banowali: {', '.join(c for c, _ in history['bans'].most_common(5)) or 'brak danych'}"
         )
-    if report["pro_meta"]:
-        top = sorted(report["pro_meta"].values(), key=lambda c: -(c["presence"] or 0))[:10]
-        lines.append(
-            f"Obecność w draftach pro (pick + ban, gol.gg, patche {', '.join(report['pro_patches'])}): "
-            + ", ".join(f"{c['champion']} {pct(c['presence'])}" for c in top)
-        )
+    lines += report.get("our_team", [])
+    lines += meta_facts(report)
     return "\n".join(lines)
 
 
@@ -1062,9 +1227,13 @@ async def run_scouting(team_name: str, riot_ids: list[str], months: int = SCOUT_
             "history": await history_against_us(team_name),
         }
         report["bans"] = ban_suggestions(players)
+        report["our_team"] = await our_team_facts(now_ts * 1000)
         report["summary"] = None
         if llm.enabled() and any(p.get("summary") for p in players):
-            report["summary"] = await llm.complete(SUMMARY_PROMPT, summary_facts(report), max_tokens=1500, temperature=0.4)
+            report["summary"] = await llm.complete(
+                draft_system_prompt(), summary_facts(report), max_tokens=6000, temperature=0.4,
+                model=SCOUT_MODEL, latin_only=True, reasoning_effort=SCOUT_REASONING, timeout=300,
+            )
         return report
 
 
@@ -1096,11 +1265,19 @@ def pro_note(report: dict) -> str:
     return f"pro: gol.gg, patche {', '.join(report['pro_patches'])}"
 
 
+def embed_summary(summary: str | None, limit: int = 2000) -> str | None:
+    """The draft plan for the embed: "### " headings as bold, cut at limit with an ellipsis."""
+    if not summary:
+        return None
+    text = re.sub(r"^#+\s*(.+)$", r"**\1**", summary.strip(), flags=re.M)
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
 def embed_with(report: dict, count: int) -> discord.Embed:
     embed = discord.Embed(
         title=f"🔎 Scouting: {report['team']}"[:256],
         color=discord.Color.purple(),
-        description=(report["summary"] or "")[:2000] or None,
+        description=embed_summary(report["summary"]),
         timestamp=report["created"],
     )
     for player in report["players"][:10]:
@@ -1134,7 +1311,7 @@ def embed_with(report: dict, count: int) -> discord.Embed:
     if report["bans"]:
         embed.add_field(
             name="🚫 Sugerowane bany",
-            value="\n".join(f"**{b['champion']}** ({b['player']}) {b['reason']}" for b in report["bans"])[:1024],
+            value="\n".join(f"**{b['champion']}** ({b['player']}) {b['reason']}" for b in report["bans"][:EMBED_BANS])[:1024],
             inline=False,
         )
     history = report["history"]
@@ -1153,6 +1330,10 @@ def embed_with(report: dict, count: int) -> discord.Embed:
         + (" · pełne tabele w zakładce Scouting" if GOOGLE_SHEET_ID else "")
     ))
     return embed
+
+
+def rounded_or_blank(value: float | None):
+    return "" if value is None else round(value, 1)
 
 
 def share(value: float | None):
@@ -1211,8 +1392,11 @@ def build_sheet_rows(report: dict) -> tuple[list[list], dict]:
         add()
         layout["sections"].append(add((0, ["Podsumowanie"])))
         for line in report["summary"].splitlines():
-            if line.strip():
-                add((0, [line.strip().replace("**", "")]))
+            line = line.strip().replace("**", "")
+            if line.startswith("#"):
+                layout["labels"].append(add((0, [line.lstrip("#").strip()])))
+            elif line:
+                add((0, [line]))
 
     history = report["history"]
     if history["games"]:
@@ -1266,7 +1450,8 @@ def build_sheet_rows(report: dict) -> tuple[list[list], dict]:
             f"top {PRO_META_ROWS} wg obecności w draftach (pick + ban)"
         ])))
         add_table(PRO_COLUMNS, [
-            [c["champion"], c["picks"], c["bans"], share(c["presence"]), share(c["wr"])]
+            [c["champion"], c["picks"], c["bans"], share(c["presence"]), share(c["wr"]),
+             rounded_or_blank(c.get("ban_turn")), rounded_or_blank(c.get("pick_round")), role_list(c.get("roles") or {})]
             for c in sorted(report["pro_meta"].values(), key=lambda c: -(c["presence"] or 0))[:PRO_META_ROWS]
         ])
     return grid, layout
