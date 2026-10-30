@@ -31,6 +31,8 @@ ACTIVITY_DAYS = 7
 # Each fetch re-checks this far before the previous one, so games in progress then aren't missed
 MATCH_SYNC_OVERLAP_SECONDS = 3 * 60 * 60
 MATCH_IDS_PAGE = 100
+# SoloQ games stored before lane opponents were kept get them filled in, this many per sync
+LANE_OPPONENT_BACKFILL = 150
 
 # Layout of the SoloQ tab
 TEAM_HEADERS = [
@@ -143,6 +145,7 @@ def match_rows(match_id: str, match_data: dict, tracked_puuids: set[str]) -> lis
             "assists": stats["assists"],
             "game_start": stats["game_start_timestamp"],
             "game_duration": info.get("gameDuration", 0),
+            "lane_opponent": stats["lane_opponent"] or "",
         })
     return rows
 
@@ -400,6 +403,25 @@ async def sync_player_matches(puuid: str, tracked_puuids: set[str], now: int) ->
     return added
 
 
+async def backfill_lane_opponents(puuids: set[str], since_ms: int, limit: int) -> int:
+    """Fill in the lane opponent of stored SoloQ games without one, fetching each game once. Returns how many."""
+    match_ids = await db.get_matches_without_lane_opponent(list(puuids), since_ms, limit)
+    for match_id in match_ids:
+        try:
+            match_data = await riot_api.get_match_details(match_id)
+        except RiotAPIError as e:
+            print(f"No lane opponents for {match_id}: {e}")
+            continue
+        updates = []
+        for puuid in puuids:
+            stats = riot_api.extract_player_match_stats(match_data, puuid)
+            if stats:
+                updates.append((stats["lane_opponent"] or "", match_id, puuid))
+        await db.set_lane_opponents(updates)
+        await asyncio.sleep(0.5)  # Rate limit
+    return len(match_ids)
+
+
 async def sync_team_sheet() -> dict:
     """
     Sync the team sheet: roster from "Skład" into the team leaderboard, new games from
@@ -427,6 +449,11 @@ async def sync_team_sheet() -> dict:
                 new_games += await sync_player_matches(puuid, set(tracked), now_ts)
             except RiotAPIError as e:
                 print(f"Error fetching matches for {player['riot_id']}: {e}")
+
+        try:
+            await backfill_lane_opponents(set(tracked), (now_ts - MATCH_HISTORY_DAYS * DAY_SECONDS) * 1000, LANE_OPPONENT_BACKFILL)
+        except RiotAPIError as e:
+            print(f"Error filling in lane opponents: {e}")
 
         matches = await db.get_matches_since(list(tracked), (now_ts - MATCH_HISTORY_DAYS * DAY_SECONDS) * 1000)
         week_ago = now.astimezone(timezone.utc).replace(tzinfo=None) - timedelta(days=ACTIVITY_DAYS)

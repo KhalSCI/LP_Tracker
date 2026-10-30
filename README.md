@@ -104,9 +104,14 @@ The Riot API doesn't return regular custom games, so scrims come from the LoL cl
 
 The `period` option also offers a quick scouting: SoloQ of the last month and tournament-code games of the last 12 months, usually done in a few minutes.
 
-The draft plan at the top of the report comes from a stronger model than the game comments (`SCOUT_MODEL`, default `anthropic/claude-sonnet-5.5`, with some thinking: `SCOUT_REASONING`; a scouting costs a few cents). It gets the opponents' pools, the suggested bans, our roster's pools (SoloQ of the last month, scrims and officials), and the pro meta of the last 3 patches from gol.gg with presence in drafts, winrate, average ban turn, average pick round, roles and flex picks (each patch is read for all roles and per role), and answers in fixed sections: key players, phase 1 bans, phase 2 bans, our picks, what to watch out for, blue and red plans. The team's own draft knowledge goes in `draft_guide.md` (kept out of git; copy `draft_guide.example.md` and fill it in), which the model follows over the general rules.
+The report keeps text to a minimum: three short points from a stronger model (`SCOUT_MODEL`, default `anthropic/claude-sonnet-5.5`, with some thinking: `SCOUT_REASONING`; a scouting costs a few cents), then data:
 
-The report also has up to 10 suggested bans (comfort picks by games and smoothed winrate, tournament games count triple; SoloQ and tournament games and winrates are shown in separate columns), what the team picked and banned against us, the presence in pro drafts (picks and bans per game) and winrate of each champion from [gol.gg](https://gol.gg) over the last 3 patches (all tournaments, cached for a day; gol.gg keeps its patch filter in a session, so each patch is posted in one session), and with an OpenRouter key a short summary. The embed goes to the channel and the full tables to the bot-only `Scouting` tab (overwritten and re-formatted by each scouting: colored player bands and table headers, real percentages, winrates colored green or red). There is no limit on the number of games: everything in the period is fetched, about 1.3 seconds per game because of the Riot API rate limit, so after counting the games the bot posts how long it will take (a 12-month first scouting of active players can take over an hour). Games are cached in `scout_games`, so later scoutings only fetch new games. When the 24-hour (or day-before) reminder of an official (any type but Scrim) is posted and the opponent's players are known, the bot scouts it automatically and posts the report under the reminder.
+- **Bans** (up to 10), each tagged: 🎯 comfort pick of theirs (tournament games count triple, then SoloQ), ⚔ beats what we play most (our two main picks per role, scrims counting triple over SoloQ, lose at most 47% of a 300+ game matchup at Emerald+; more when they play it) and 📈 strong in pro drafts.
+- **Our answers per role**: the opponent's likeliest picks there (champions with 2+ tournament games first) and the best answers from our pool on that role, by OP.GG's Emerald+ matchup win rate with the number of games, plus our own record in that matchup from scrims and officials and from SoloQ.
+
+Matchup win rates come from OP.GG's public MCP API (one lane matchup guide per champion gives its record against every opponent in the position; cached for a day, see `opgg.py`). Our SoloQ games keep their lane opponent (`matches.lane_opponent`, filled in for older games 150 per sheet sync). The model also gets our roster's pools, the pro meta of the last 3 patches from gol.gg (presence, winrate, average ban turn and pick round, roles, flex picks) and the team's own draft knowledge from `draft_guide.md` (kept out of git; copy `draft_guide.example.md` and fill it in), which it follows over the general rules.
+
+Below that come the player cards (rank, accounts, SoloQ and tournament champions with games, W/L, winrate, KDA and pro presence), what the team picked and banned against us, and the pro meta.
 
 ```env
 SCOUT_MONTHS=6                      # default period in months (/scout offers 3, 6 and 12)
@@ -238,6 +243,7 @@ game_stats.py       — Full data of team games: raw JSON, timelines, per-player
 stats_tab.py        — Statystyki tab from those stats
 scouting.py         — Opponent scouting (Riot API pools, gol.gg pro meta, Scouting tab)
 scouting_web.py     — Scouting reports as HTML pages and their index
+opgg.py             — Champion matchup win rates from OP.GG (Emerald+)
 sheet_format.py     — Formatting requests shared by the bot-written tabs
 drafts.py           — Drafty tab analysis
 champions.py        — Champion names from Data Dragon

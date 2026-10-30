@@ -51,6 +51,17 @@ h2 { font-size:18px; margin:34px 0 12px; padding-bottom:6px; border-bottom:1px s
 .tag { display:inline-block; font-size:12px; border-radius:4px; padding:1px 7px; margin-left:4px; }
 .tag.warn { background:rgba(248,113,113,.15); color:var(--bad); } .tag.note { background:rgba(139,149,161,.15); color:var(--muted); }
 .tag.hint { background:rgba(250,204,21,.12); color:#facc15; }
+.tags { margin:2px 0 4px; display:flex; flex-wrap:wrap; gap:4px; } .tags .tag { margin-left:0; }
+.tag.comfort { background:rgba(63,208,182,.14); color:var(--accent); } .tag.counter { background:rgba(248,113,113,.15); color:var(--bad); }
+.tag.meta { background:rgba(167,139,250,.16); color:#a78bfa; }
+.answers { display:grid; gap:10px; } .answer-role { padding:0; overflow:hidden; }
+.answer-role > header { padding:8px 14px; background:var(--surface2); border-bottom:1px solid var(--border); font-size:13px; color:var(--muted); }
+.answer-role > header b { color:var(--text); font-size:14px; margin-right:6px; }
+.pick { display:grid; grid-template-columns:minmax(150px,220px) 1fr; gap:10px; padding:8px 14px; border-top:1px solid var(--border); align-items:center; }
+.pick:first-of-type { border-top:none; } .pick .them { display:flex; align-items:center; gap:8px; }
+.pick .them small { display:block; color:var(--muted); font-size:12px; }
+.pick .chips .chip small { color:var(--muted); margin-left:2px; }
+@media (max-width:700px) { .pick { grid-template-columns:1fr; } }
 .blocks { display:grid; grid-template-columns:repeat(3,1fr); gap:0; }
 .block { padding:12px 16px; border-left:1px solid var(--border); } .block:first-child { border-left:none; }
 .block h4 { margin:0 0 8px; font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
@@ -76,6 +87,10 @@ footer { margin-top:40px; color:var(--muted); font-size:12px; }
 @media (max-width:900px) { .blocks { grid-template-columns:1fr; } .block { border-left:none; border-top:1px solid var(--border); }
   .block:first-child { border-top:none; } main { padding:18px 12px 40px; } }
 """
+
+
+TAG_CLASSES = {"komfort": "comfort", "kontruje nas": "counter", "meta": "meta"}
+TAG_LABELS = {"komfort": "🎯 komfort", "kontruje nas": "⚔ kontruje nas", "meta": "📈 meta"}
 
 
 def slugify(name: str) -> str:
@@ -195,18 +210,47 @@ def player_card(player: dict) -> str:
 
 
 def ban_card(ban: dict) -> str:
+    tags = "".join(f'<span class="tag {TAG_CLASSES[t]}">{TAG_LABELS[t]}</span>' for t in ban["tags"])
     lines = ""
     if ban["ranked_games"]:
         lines += f'<div class="line"><span class="lbl">SoloQ</span>{games_count(ban["ranked_games"])} · {wr_cell(ban["ranked_wr"])}</div>'
     if ban["tourney_games"]:
         lines += f'<div class="line"><span class="lbl">Turnieje</span>{games_count(ban["tourney_games"])} · {wr_cell(ban["tourney_wr"])}</div>'
-    if ban["pro_presence"] is not None:
+    if ban.get("counter"):
+        lines += f'<div class="line"><span class="lbl">Kontra</span>{escape(ban["counter"])}</div>'
+    if ban.get("pro_presence") is not None:
         turn = f' · tura bana ~{ban["pro_ban_turn"]:.0f}' if ban.get("pro_ban_turn") else ""
         lines += f'<div class="line"><span class="lbl">Pro P+B</span>{scouting.pct(ban["pro_presence"])}{turn}</div>'
+    who = " · ".join(part for part in (ban["player"], ban["role"]) if part)
     return (
         f'<div class="card ban">{icon(ban["champion"], big=True)}<div><b>{escape(ban["champion"])}</b>'
-        f'<span class="who">{escape(ban["player"])} · {escape(ban["role"] or "?")}</span>{lines}</div></div>'
+        f'<span class="who">{escape(who)}</span><div class="tags">{tags}</div>{lines}</div></div>'
     )
+
+
+def answers_section(answers: list[dict]) -> str:
+    """Per role: the opponent's likeliest picks and our answers with matchup win rates."""
+    roles = ""
+    for role in answers:
+        picks = ""
+        for pick in role["picks"]:
+            counts = " · ".join(part for part in (
+                f"{pick['tourney']} turn." if pick["tourney"] else "", f"{pick['soloq']} SoloQ" if pick["soloq"] else "") if part)
+            chips_html = "".join(
+                f'<span class="chip">{icon(a["champion"])}{escape(a["champion"])} {wr_cell(a["wr"])}'
+                f'<small>{a["games"]}'
+                + (f' · scrimy {scouting.record_text(a["ours"]["scrims"])}' if a["ours"]["scrims"][0] else "")
+                + (f' · SoloQ {scouting.record_text(a["ours"]["soloq"])}' if a["ours"]["soloq"][0] else "")
+                + "</small></span>"
+                for a in pick["answers"]
+            ) or '<span class="meta">brak danych o matchupach z naszą pulą</span>'
+            picks += (f'<div class="pick"><div class="them">{icon(pick["champion"])}<div>{escape(pick["champion"])}'
+                      f'<small>{escape(counts)}</small></div></div><div class="chips">{chips_html}</div></div>')
+        roles += (
+            f'<article class="card answer-role"><header><span class="role">{escape(role["role"])}</span>'
+            f'<b>{escape(role["player"])}</b> nasi: {escape(", ".join(role["our_players"]) or "-")}</header>{picks}</article>'
+        )
+    return f'<section class="answers">{roles}</section>'
 
 
 def pro_timing(champion: dict) -> str:
@@ -243,11 +287,16 @@ def render_report(report: dict, index_url: str = "") -> str:
     body = f'<h1>Scouting: <span>{escape(report["team"])}</span></h1><p class="meta">{meta}</p>'
 
     if report["summary"]:
-        body += f'<h2>Plan draftu</h2><section class="card summary">{render_summary(report["summary"])}</section>'
+        body += f'<h2>Najważniejsze</h2><section class="card summary">{render_summary(report["summary"])}</section>'
 
-    body += "<h2>Sugerowane bany</h2>"
+    body += "<h2>Bany</h2>"
     body += (f'<section class="bans">{"".join(ban_card(b) for b in report["bans"])}</section>' if report["bans"]
              else '<p class="meta">Za mało gier, żeby coś zasugerować.</p>')
+
+    if report.get("answers"):
+        body += ('<h2>Nasze odpowiedzi</h2><p class="meta">Ich najczęstsze picki na każdej roli (turnieje, potem SoloQ) i '
+                 'najlepsze odpowiedzi z naszej puli na tej roli: WR matchupu na Emerald+ (OP.GG), liczba gier i nasze wyniki '
+                 'w tym matchupie.</p>' + answers_section(report["answers"]))
 
     body += "<h2>Gracze</h2>" + "".join(player_card(p) for p in report["players"])
 

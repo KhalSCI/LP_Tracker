@@ -54,6 +54,24 @@ class TestRender:
         assert html == ("<h3>Bany – faza 1</h3><ul><li><strong>Viktor</strong> — komfort</li><li>Wukong</li></ul>"
                         "<h3>Plan</h3><p>Na blue: &lt;B1&gt;</p>")
 
+    def test_answers_and_tags(self):
+        report = sample_report()
+        report["bans"][0]["tags"] = ["komfort", "kontruje nas"]
+        report["bans"][0]["counter"] = "Syndra ma 45% (600 gier)"
+        report["answers"] = [{"role": "Mid", "player": "Maly", "our_players": ["iym"], "picks": [
+            {"champion": "Wukong", "tourney": 3, "soloq": 10, "answers": [
+                {"champion": "Camille", "wr": 0.62, "games": 900, "ours": {"scrims": (2, 1), "soloq": (0, 0)}}]},
+            {"champion": "Camille", "tourney": 0, "soloq": 4, "answers": []},
+        ]}]
+
+        page = scouting_web.render_report(report)
+
+        assert '<span class="tag comfort">🎯 komfort</span><span class="tag counter">⚔ kontruje nas</span>' in page
+        assert "Syndra ma 45% (600 gier)" in page
+        assert "<h2>Nasze odpowiedzi</h2>" in page and "3 turn. · 10 SoloQ" in page
+        assert 'class="wr good">62%</span><small>900 · scrimy 1-1</small>' in page
+        assert "brak danych o matchupach z naszą pulą" in page
+
     def test_unknown_champion_gets_an_empty_icon(self):
         assert scouting_web.icon("Nowy Champion") == '<span class="icon"></span>'
 

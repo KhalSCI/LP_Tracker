@@ -208,11 +208,14 @@ class TestDraftContext:
         soloq.append({"puuid": "m", "queue_id": 440, "remake": False, "champion_name": "Zed", "win": 1})
         monkeypatch.setattr(scouting.db, "get_matches_since", AsyncMock(return_value=soloq))
         monkeypatch.setattr(scouting.db, "get_team_game_stats", AsyncMock(return_value=[
-            {"ours": True, "player": "drewin", "champion": "Aatrox", "win": True},
-            {"ours": False, "player": "E#1", "champion": "Jax", "win": False}]))
+            {"ours": True, "player": "drewin", "champion": "Aatrox", "win": True, "lane_opponent": "Gnar"},
+            {"ours": False, "player": "E#1", "champion": "Jax", "win": False, "lane_opponent": "Aatrox"}]))
 
-        lines = await scouting.our_team_facts(NOW * 1000)
+        our = await scouting.our_roster_games(NOW * 1000)
+        lines = scouting.our_team_facts(our)
 
+        assert [m["nick"] for m in our] == ["drewin", "iym"]
+        assert our[1]["soloq"][0] == {"champion": "Ahri", "opponent": None, "win": True}
         assert lines == [
             "Nasza drużyna (role ze Składu):",
             "- Top drewin (Próba): SoloQ 30 dni: brak; scrimy i oficjale: Aatrox 1 (100%)",
@@ -223,6 +226,86 @@ class TestDraftContext:
         assert scouting.embed_summary("### Bany\n• Viktor") == "**Bany**\n• Viktor"
         assert scouting.embed_summary("x" * 50, limit=10) == "x" * 9 + "…"
         assert scouting.embed_summary(None) is None
+
+
+def our_member(nick: str, role: str, scrims=(), soloq=()) -> dict:
+    """Our roster player with games given as (champion, opponent, win)."""
+    def games_of(items):
+        return [{"champion": c, "opponent": o, "win": w} for c, o, w in items]
+    return {"nick": nick, "role": role, "status": "Main", "scrims": games_of(scrims), "soloq": games_of(soloq)}
+
+
+class TestAnswers:
+    """Test cases for our answers per role and the tags of suggested bans."""
+
+    def enemy_mid(self) -> dict:
+        history = games("Viktor", 6, 2, role="Mid") + games("Veigar", 4, 4, role="Mid") + games("Syndra", 2, 0, queue=3130, role="Mid")
+        return player(summarize(history, NOW, 6, {}), account("Maly#pit"))
+
+    def our_mid(self) -> list[dict]:
+        return [our_member("iym", "Mid",
+                           scrims=[("Orianna", "Viktor", True)],
+                           soloq=[("Syndra", "Viktor", True), ("Syndra", "Viktor", False), ("Syndra", "Lux", True),
+                                  ("Syndra", "Lux", True), ("Ahri", None, True), ("Ahri", None, False), ("Akali", "Veigar", True)])]
+
+    def tables(self) -> dict:
+        return {
+            ("Viktor", "Mid"): {"Syndra": (1000, 480), "Orianna": (800, 400), "Ahri": (2000, 1100)},
+            ("Veigar", "Mid"): {"Akali": (500, 200)},
+            ("Syndra", "Mid"): {"Kassadin": (600, 270), "Viktor": (1000, 520)},
+            ("Orianna", "Mid"): {"Fizz": (50, 10)},
+        }
+
+    def test_role_pool_counts_scrims_more(self):
+        assert scouting.role_pool(self.our_mid(), "Mid", 3) == ["Syndra", "Orianna", "Ahri"]
+
+    def test_their_picks_put_tournaments_first(self):
+        assert [p["champion"] for p in scouting.their_picks(self.enemy_mid())] == ["Syndra", "Viktor", "Veigar"]
+
+    def test_answers(self):
+        report = report_with([self.enemy_mid()])
+
+        [mid] = scouting.role_answers(report, self.our_mid(), self.tables())
+
+        viktor = next(p for p in mid["picks"] if p["champion"] == "Viktor")
+        assert (mid["role"], mid["player"], mid["our_players"]) == ("Mid", "Maly", ["iym"])
+        assert [(a["champion"], round(a["wr"], 2), a["games"]) for a in viktor["answers"]] == [
+            ("Syndra", 0.52, 1000), ("Orianna", 0.5, 800), ("Ahri", 0.45, 2000)]
+        assert viktor["answers"][0]["ours"] == {"scrims": (0, 0), "soloq": (2, 1)}
+        assert viktor["answers"][1]["ours"] == {"scrims": (1, 1), "soloq": (0, 0)}
+        veigar = next(p for p in mid["picks"] if p["champion"] == "Veigar")
+        assert [(a["champion"], a["wr"]) for a in veigar["answers"]] == [("Akali", 0.6)]
+        assert mid["picks"][0]["champion"] == "Syndra" and mid["picks"][0]["answers"] == []
+        assert scouting.answer_line(mid) == "**Mid**: Viktor → Syndra 52%, Orianna 50%, Ahri 45%"
+
+    def test_counters_and_tags(self):
+        report = report_with([self.enemy_mid()])
+        counters = scouting.counters_to_us(report, self.our_mid(), self.tables())
+
+        assert set(counters) == {"Kassadin"}  # beats our Syndra at 45% over 600 games; Fizz has too few
+        assert counters["Kassadin"]["vs"] == "Syndra" and not counters["Kassadin"]["in_their_pool"]
+
+        pro = {"viktor": {"presence": 0.5, "wr": 0.5, "ban_turn": 3.0}}
+        bans = ban_suggestions(report["players"], counters, pro)
+        by_name = {b["champion"]: b for b in bans}
+        assert by_name["Viktor"]["tags"] == ["komfort", "meta"]
+        assert by_name["Kassadin"]["tags"] == ["kontruje nas"] and by_name["Kassadin"]["counter"] == "Syndra ma 45% (600 gier)"
+        assert scouting.ban_detail(by_name["Kassadin"]) == "kontra: Syndra ma 45% (600 gier)"
+        assert scouting.tag_icons(by_name["Viktor"]) == "🎯📈"
+
+    def test_answers_table_in_the_sheet(self):
+        report = report_with([self.enemy_mid()])
+        report["answers"] = scouting.role_answers(report, self.our_mid(), self.tables())
+
+        rows, layout = build_sheet_rows(report)
+
+        label = next(i for i, row in enumerate(rows) if row[0].startswith("Mid · ich gracz: Maly"))
+        assert rows[label + 1][:3] == ["Ich pick", "Turnieje", "SoloQ"] and rows[label + 1][9] == "Nasza odpowiedź"
+        viktor = next(i for i in range(label, len(rows)) if rows[i][0] == "Viktor")
+        assert rows[viktor][:3] == ["Viktor", "", 8] and rows[viktor][9:14] == ["Syndra", 0.52, 1000, "", "1-1"]
+        assert rows[viktor + 1][0] == "" and rows[viktor + 1][9] == "Orianna"
+        assert rows[label + 2][0] == "Syndra" and rows[label + 2][9] == "brak danych"
+        assert label in layout["labels"] and (label + 1, 9) in [(t[0], t[2]) for t in layout["tables"]]
 
 
 class TestSummarize:
@@ -404,8 +487,10 @@ class TestSheetRows:
 
         assert all(len(row) == SHEET_COLS for row in rows)
         assert rows[0][0] == "Scouting: AGH" and "patche 16.20, 16.18, 16.17" in rows[1][0]
-        assert rows[4][:9] == ["Champion", "SoloQ gry", "SoloQ WR", "Turnieje gry", "Turnieje WR", "Pro P+B", "Pro WR", "Rola", "Gracz"]
-        assert rows[5][:9] == ["Camille", 10, 0.8, "", "", "", "", "Top", "Top"]
+        bans = next(i for i, row in enumerate(rows) if row[:2] == ["Champion", "Tagi"])
+        assert rows[bans][:9] == ["Champion", "Tagi", "SoloQ gry", "SoloQ WR", "Turnieje gry", "Turnieje WR", "Pro P+B", "Rola", "Dlaczego"]
+        assert rows[bans + 1][:9] == ["Camille", "🎯", 10, 0.8, "", "", "", "Top", "Top: SoloQ: 10 gier, 80% WR"]
+        assert rows.index(["Najważniejsze"] + [""] * (SHEET_COLS - 1)) < bans
         band = next(row for row in rows if row[0].startswith("Top · "))
         assert band[0] == "Top · Top#EUW (EUW, SoloQ: Unranked)"
         titles = next(row for row in rows if row[0].startswith("SoloQ, ostatnie"))
@@ -416,9 +501,9 @@ class TestSheetRows:
         assert rows[header + 1][:8] == ["Camille", 10, 8, 2, 0.8, 5.0, "", ""]
         assert rows[header + 1][18:20] == ["Gnar", 1]
         assert rows[-1][0] == "X#1: ⚠ Nie znaleziono konta"
-        assert 3 in layout["sections"] and rows.index(band) in layout["bands"]
+        assert bans - 1 in layout["sections"] and rows.index(band) in layout["bands"]
         assert ["• banujcie Camille"] == [row[0] for row in rows if row[0].startswith("•")]
-        assert (4, 6, 0) in [t[:3] for t in layout["tables"]]
+        assert (bans, bans + 2, 0) in [t[:3] for t in layout["tables"]]
         assert [t[2] for t in layout["tables"] if t[0] == header] == [0, 9, 18]
 
     def test_summary_headings_are_bold_rows(self):
@@ -503,7 +588,8 @@ class TestEmbed:
 
     def test_five_accounts_get_four_champions(self):
         embed = scouting.build_embed(self.report(5))
-        value = embed.fields[0].value
+        assert embed.fields[0].name.startswith("🚫 Bany")
+        value = next(f for f in embed.fields if f.name.startswith("Top · ")).value
         assert value.split("\n", 1)[1].count("(") == 4 * 3
         assert "**SoloQ, 6 mies.:**" in value and "**SoloQ, 3 mies.:**" in value and "**Turnieje, 6 mies.:**" in value
 

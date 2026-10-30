@@ -260,6 +260,14 @@ class RiotAPI:
                 game_duration_minutes = game_duration_seconds / 60
                 cs_per_min = round(total_cs / max(game_duration_minutes, 1), 2)
 
+                # The enemy in the same position, e.g. the other mid laner
+                position = participant.get("teamPosition") or ""
+                opponent = next(
+                    (p for p in participants
+                     if position and p.get("teamId") != participant.get("teamId") and p.get("teamPosition") == position),
+                    None
+                )
+
                 return {
                     "match_id": match_data.get("metadata", {}).get("matchId"),
                     "win": participant.get("win", False),
@@ -277,6 +285,8 @@ class RiotAPI:
                     "queue_id": info.get("queueId", 0),
                     "team_id": participant.get("teamId", 0),
                     "remake": participant.get("gameEndedInEarlySurrender", False),
+                    "position": position,
+                    "lane_opponent": opponent.get("championName") if opponent else None,
                 }
 
         return None

@@ -285,6 +285,12 @@ async def init_db():
         except Exception:
             pass  # Column already exists
 
+        # Migration: lane opponent's champion (match-v5 key) of stored games; "" = none, NULL = not checked
+        try:
+            await db.execute("ALTER TABLE matches ADD COLUMN lane_opponent TEXT")
+        except Exception:
+            pass  # Column already exists
+
         # Migration: Add Discord nickname column to players table if it doesn't exist
         try:
             await db.execute(
@@ -734,11 +740,33 @@ async def save_matches(rows: list[dict]) -> None:
         await db.executemany(
             """INSERT OR IGNORE INTO matches
                (match_id, puuid, queue_id, team_id, champion_name, win, remake,
-                kills, deaths, assists, game_start, game_duration)
+                kills, deaths, assists, game_start, game_duration, lane_opponent)
                VALUES (:match_id, :puuid, :queue_id, :team_id, :champion_name, :win, :remake,
-                       :kills, :deaths, :assists, :game_start, :game_duration)""",
-            rows
+                       :kills, :deaths, :assists, :game_start, :game_duration, :lane_opponent)""",
+            [{"lane_opponent": None, **row} for row in rows]
         )
+        await db.commit()
+
+
+async def get_matches_without_lane_opponent(puuids: list[str], since_ms: int, limit: int, queue_id: int = 420) -> list[str]:
+    """IDs of stored games (of the given players, since since_ms) whose lane opponent wasn't checked yet."""
+    if not puuids:
+        return []
+    async with aiosqlite.connect(DB_PATH) as db:
+        placeholders = ",".join("?" * len(puuids))
+        cursor = await db.execute(
+            f"""SELECT DISTINCT match_id FROM matches
+                WHERE puuid IN ({placeholders}) AND queue_id = ? AND game_start >= ? AND lane_opponent IS NULL
+                ORDER BY game_start DESC LIMIT ?""",
+            (*puuids, queue_id, since_ms, limit)
+        )
+        return [row[0] for row in await cursor.fetchall()]
+
+
+async def set_lane_opponents(rows: list[tuple[str, str, str]]) -> None:
+    """Store lane opponents as (lane_opponent, match_id, puuid); "" when there is none."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany("UPDATE matches SET lane_opponent = ? WHERE match_id = ? AND puuid = ?", rows)
         await db.commit()
 
 

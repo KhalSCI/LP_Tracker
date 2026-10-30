@@ -22,6 +22,7 @@ import gspread
 
 import database as db
 import llm
+import opgg
 from champions import champions
 from cogs.sheet import format_tier, APEX_TIERS, SOLOQ_QUEUE
 from config import TIMEZONE, SCOUT_MONTHS, SCOUT_MODEL, SCOUT_REASONING, GOOGLE_SHEET_ID
@@ -78,6 +79,23 @@ GOLGG_DELAY = 0.5
 # A champion is a flex pick when another role has at least this share of its pro picks
 FLEX_SHARE = 0.2
 FLEX_MIN_PICKS = 5
+# Answers per role: the opponent's likeliest picks there (tournament games count TOURNEY_WEIGHT
+# times) and our best answers from our pool on that role, by OP.GG's Emerald+ matchup win rate
+THEIR_PICKS = 4
+OUR_ROLE_POOL = 8
+ANSWERS_PER_PICK = 3
+MIN_MATCHUP_GAMES = 100
+# Tags of suggested bans: comfort picks of theirs, champions that beat what we play most (our
+# OUR_MAIN_PICKS per role, scrims counting SCRIM_WEIGHT times), and strong pro-meta champions
+OUR_MAIN_PICKS = 2
+SCRIM_WEIGHT = 3
+COUNTER_WR = 0.47
+MIN_COUNTER_GAMES = 300
+COUNTER_WEIGHT = 10
+IN_THEIR_POOL, NOT_IN_THEIR_POOL = 1.5, 0.6
+META_PRESENCE = 0.35
+META_BONUS = 0.2
+TAGS = {"komfort": "🎯", "kontruje nas": "⚔", "meta": "📈"}
 # Draft plan context: pro-meta champions given to the model, and our players' pools
 META_FACTS_CHAMPIONS = 25
 META_ROLE_PICKS = 6
@@ -136,37 +154,24 @@ BLOCK_STARTS = (0, 9, 18)
 # Sheet tables' columns as (header, kind), kinds as in sheet_format; long names go last so they can overflow
 BLOCK_COLUMNS = [("Champion", "name"), ("Gry", "int"), ("W", "int"), ("L", "int"), ("WR", "wr"), ("KDA", "dec2"),
                  ("Pro P+B", "pct"), ("Pro WR", "pct")]
-BAN_COLUMNS = [("Champion", "name"), ("SoloQ gry", "int"), ("SoloQ WR", "wr"), ("Turnieje gry", "int"),
-               ("Turnieje WR", "wr"), ("Pro P+B", "pct"), ("Pro WR", "pct"), ("Rola", "text"), ("Gracz", "text")]
+BAN_COLUMNS = [("Champion", "name"), ("Tagi", "text"), ("SoloQ gry", "int"), ("SoloQ WR", "wr"), ("Turnieje gry", "int"),
+               ("Turnieje WR", "wr"), ("Pro P+B", "pct"), ("Rola", "text"), ("Dlaczego", "text")]
+# Answers per role: their pick in the first block (A), our answer in the second (J)
+THEIR_PICK_COLUMNS = [("Ich pick", "name"), ("Turnieje", "int"), ("SoloQ", "int")]
+ANSWER_COLUMNS = [("Nasza odpowiedź", "name"), ("WR Emerald+", "wr"), ("Gry", "int"), ("Nasze scrimy", "text"),
+                  ("Nasze SoloQ", "text")]
 PRO_COLUMNS = [("Champion", "name"), ("Picki", "int"), ("Bany", "int"), ("P+B", "pct"), ("WR", "pct"),
                ("Śr. tura bana", "dec1"), ("Śr. runda picku", "dec1"), ("Role", "text")]
 SHEET_COLS = 26
 COLUMN_WIDTHS = {start: 130 for start in BLOCK_STARTS}
 DEFAULT_WIDTH = 62
 
-DRAFT_PROMPT = """Jesteś analitykiem draftu uczelnianej drużyny League of Legends i przygotowujesz plan draftu na mecz z przeciwnikiem.
-Dostajesz:
-1. Graczy przeciwnika: rangi, pule championów z SoloQ i osobno z gier turniejowych (kody turniejowe; lepiej pokazują, co grają w meczach drużynowych). Gracz może mieć kilka kont, jego gry są już zsumowane.
-2. Sugestie banów policzone z danych (komforty: liczba gier i winrate).
-3. Naszą drużynę: pule z SoloQ z ostatniego miesiąca oraz ze scrimów i oficjali.
-4. Metę z gry profesjonalnej z ostatnich patchy (gol.gg): obecność w draftach (pick + ban na grę), winrate, średnią turę bana (1 = pierwszy ban), średnią rundę picku (bliżej 1 = wcześniej w drafcie), role i flex picki.
-5. Wytyczne drużyny od kapitana: mają pierwszeństwo przed ogólnymi zasadami.
-
-Draft turniejowy: faza 1 to po 3 bany i picki B1, R1-R2, B2-B3, R3; faza 2 to po 2 bany (red banuje pierwszy) i picki R4, B4-B5, R5. Champions z wczesną rundą picku w pro to bezpieczne, priorytetowe picki na początek draftu; te z późną to zwykle kontry na ostatnie picki. Bany fazy 1 celują w komforty przeciwnika potwierdzone w turniejach i w najmocniejsze picki mety; bany fazy 2 chronią nasz skład i celują w rolę, którą przeciwnik jeszcze wybiera. Flex picki chowają rolę do końca draftu.
-
-Opieraj się wyłącznie na podanych danych i nie wymyślaj statystyk. Przy małych próbkach (1-3 gry) zaznacz niepewność. Pisz po polsku, konkretnie, nazwami championów i graczy.
-Odpowiedz tylko tymi sekcjami, nagłówki zaczynaj od "### ", punkty od "• ":
-### Kluczowi gracze
-### Bany – faza 1
-(3-5 propozycji, każda z uzasadnieniem z danych)
-### Bany – faza 2
-(warunkowo, np. jeśli wezmą X, jeśli my weźmiemy Y)
-### Nasze picki
-(co brać wcześnie z naszej puli w tej mecie, co zostawić na kontrę)
-### Na co uważać
-(ich flex picki, późne kontry, one-tricki)
-### Plan na blue i red
-Razem najwyżej około 2500 znaków."""
+DRAFT_PROMPT = """Jesteś analitykiem draftu uczelnianej drużyny League of Legends. Dostajesz dane o przeciwniku (pule z SoloQ i z gier turniejowych), sugerowane bany z tagami (komfort przeciwnika, kontruje nas, meta), nasze odpowiedzi na każdej roli z winrate'ami matchupów (OP.GG, Emerald+) i naszymi wynikami, nasze pule oraz metę z gry profesjonalnej.
+Napisz dokładnie 3 punkty, każdy w jednej linii zaczynającej się od "• ", najwyżej około 130 znaków:
+• co banować i dlaczego (konkretne championy),
+• co pickować (nasze najlepsze odpowiedzi z danych),
+• największe ryzyko w drafcie.
+Bez wstępu, nagłówków i podsumowania. Tylko podane dane, nazwy championów i graczy; przy małych próbkach zaznacz niepewność. Wytyczne drużyny, jeśli są, mają pierwszeństwo."""
 
 _scout_lock = asyncio.Lock()
 _pro_meta_cache: dict[int, tuple[float, dict]] = {}
@@ -839,10 +844,10 @@ def account_text(account: dict, merged: bool) -> str:
     return text + ")"
 
 
-def ban_suggestions(players: list[dict]) -> list[dict]:
+def comfort_candidates(players: list[dict]) -> list[dict]:
     """
-    Champions worth banning: players' comfort picks in the period, weighted by games and a
-    smoothed winrate, with tournament games counting TOURNEY_WEIGHT times.
+    Players' comfort picks in the period, weighted by games and a smoothed winrate, with
+    tournament games counting TOURNEY_WEIGHT times; best first, one per champion.
     """
     candidates = []
     for player in players:
@@ -868,20 +873,47 @@ def ban_suggestions(players: list[dict]) -> list[dict]:
                 "role": summary["role"],
                 "score": games * (wins + 1) / (games + 2),
                 "reason": " · ".join(reasons),
+                "ranked_label": summary["ranked_label"],
                 "ranked_games": r["games"] if r else 0,
                 "ranked_wr": r["wr"] if r else None,
                 "tourney_games": t["games"] if t else 0,
                 "tourney_wr": t["wr"] if t else None,
-                "pro_presence": (r or t)["pro_presence"],
-                "pro_ban_turn": (r or t)["pro_ban_turn"],
-                "pro_wr": (r or t)["pro_wr"],
             })
-    suggestions, seen = [], set()
+    best, seen = [], set()
     for candidate in sorted(candidates, key=lambda c: -c["score"]):
         if candidate["champion"] not in seen:
             seen.add(candidate["champion"])
-            suggestions.append(candidate)
-    return suggestions[:BAN_SUGGESTIONS]
+            best.append(candidate)
+    return best
+
+
+def ban_suggestions(players: list[dict], counters: dict[str, dict] = None, pro_meta: dict = None) -> list[dict]:
+    """
+    Up to BAN_SUGGESTIONS bans, each with "tags": "komfort" (their comfort picks, scored
+    relative to the best one), "kontruje nas" (beats one of our most played champions, see
+    counters_to_us; more when they play it) and "meta" (strong in pro drafts).
+    """
+    comfort = comfort_candidates(players)
+    top_score = max((c["score"] for c in comfort), default=1) or 1
+    candidates = {c["champion"]: dict(c, tags=["komfort"], points=c["score"] / top_score) for c in comfort}
+    for champion, counter in (counters or {}).items():
+        entry = candidates.setdefault(champion, {
+            "champion": champion, "player": counter.get("player", ""), "role": counter["role"],
+            "reason": "", "ranked_label": "SoloQ", "ranked_games": 0, "ranked_wr": None, "tourney_games": 0,
+            "tourney_wr": None, "tags": [], "points": 0.0,
+        })
+        entry["tags"].append("kontruje nas")
+        entry["counter"] = f"{counter['vs']} ma {pct(counter['wr'])} ({counter['games']} gier)"
+        entry["points"] += (0.5 - counter["wr"]) * COUNTER_WEIGHT * (IN_THEIR_POOL if counter["in_their_pool"] else NOT_IN_THEIR_POOL)
+        if not entry["reason"]:
+            entry["reason"] = f"kontruje nas: {entry['counter']}"
+    for entry in candidates.values():
+        pro = (pro_meta or {}).get(champion_key(entry["champion"]), {})
+        entry["pro_presence"], entry["pro_wr"], entry["pro_ban_turn"] = pro.get("presence"), pro.get("wr"), pro.get("ban_turn")
+        if (entry["pro_presence"] or 0) >= META_PRESENCE:
+            entry["tags"].append("meta")
+            entry["points"] += META_BONUS
+    return sorted(candidates.values(), key=lambda c: -c["points"])[:BAN_SUGGESTIONS]
 
 
 async def history_against_us(team_name: str) -> dict:
@@ -1100,8 +1132,12 @@ def champion_counts(games: list[tuple[str, bool]], count: int) -> str:
     return ", ".join(f"{champion} {n} ({round(wins / n * 100)}%)" for champion, (n, wins) in ordered[:count]) or "brak"
 
 
-async def our_team_facts(now_ms: int) -> list[str]:
-    """Our roster's pools for the model: SoloQ of the last OUR_POOL_DAYS days, scrims and officials."""
+async def our_roster_games(now_ms: int) -> list[dict]:
+    """
+    Our roster players with a role (from "Skład") and their games: {"nick", "role", "status",
+    "scrims", "soloq"}, games as {"champion", "opponent", "win"} (scrims and officials, then
+    SoloQ of the last OUR_POOL_DAYS days), champions by display name.
+    """
     if not GOOGLE_SHEET_ID:
         return []
     from team_games import load_team_roster  # team_games is only needed here
@@ -1115,17 +1151,146 @@ async def our_team_facts(now_ms: int) -> list[str]:
     members.sort(key=lambda m: ROLES.index(m["role"]))
     soloq = await db.get_matches_since([m["puuid"] for m in members if m.get("puuid")], now_ms - OUR_POOL_DAYS * DAY_MS)
     team_rows = [r for r in await db.get_team_game_stats() if r["ours"]]
+    return [
+        {
+            "nick": member["nick"],
+            "role": member["role"],
+            "status": statuses[member["riot_id"].lower()],
+            "scrims": [{"champion": r["champion"], "opponent": r["lane_opponent"], "win": bool(r["win"])}
+                       for r in team_rows if r["player"] == member["nick"]],
+            "soloq": [
+                {"champion": champions.name(champion_key=g["champion_name"]),
+                 "opponent": champions.name(champion_key=g["lane_opponent"]) if g.get("lane_opponent") else None,
+                 "win": bool(g["win"])}
+                for g in soloq if g["puuid"] == member["puuid"] and g["queue_id"] == SOLOQ_QUEUE and not g["remake"]
+            ],
+        }
+        for member in members
+    ]
+
+
+def our_team_facts(our: list[dict]) -> list[str]:
+    """Our players' pools as text for the model."""
+    if not our:
+        return []
     lines = ["Nasza drużyna (role ze Składu):"]
-    for member in members:
-        solo = [(champions.name(champion_key=g["champion_name"]), g["win"]) for g in soloq
-                if g["puuid"] == member["puuid"] and g["queue_id"] == SOLOQ_QUEUE and not g["remake"]]
-        team = [(r["champion"], r["win"]) for r in team_rows if r["player"] == member["nick"]]
+    for member in our:
+        solo = [(g["champion"], g["win"]) for g in member["soloq"]]
+        team = [(g["champion"], g["win"]) for g in member["scrims"]]
         lines.append(
-            f"- {member['role']} {member['nick']} ({statuses[member['riot_id'].lower()] or 'skład'}): "
+            f"- {member['role']} {member['nick']} ({member['status'] or 'skład'}): "
             f"SoloQ {OUR_POOL_DAYS} dni: {champion_counts(solo, OUR_POOL_CHAMPIONS)}; "
             f"scrimy i oficjale: {champion_counts(team, OUR_POOL_CHAMPIONS)}"
         )
     return lines
+
+
+def role_pool(our: list[dict], role: str, count: int) -> list[str]:
+    """What our players on a role play most: scrim and official games count SCRIM_WEIGHT times."""
+    weights = Counter()
+    for member in our:
+        if member["role"] == role:
+            for game in member["scrims"]:
+                weights[game["champion"]] += SCRIM_WEIGHT
+            for game in member["soloq"]:
+                weights[game["champion"]] += 1
+    return [champion for champion, _ in weights.most_common(count)]
+
+
+def our_record(our: list[dict], role: str, champion: str, opponent: str) -> dict[str, tuple[int, int]]:
+    """Our games and wins on a role with champion against opponent: {"scrims": (games, wins), "soloq": ...}."""
+    record = {"scrims": [0, 0], "soloq": [0, 0]}
+    for member in our:
+        if member["role"] != role:
+            continue
+        for kind in ("scrims", "soloq"):
+            for game in member[kind]:
+                if game["champion"] == champion and game["opponent"] == opponent:
+                    record[kind][0] += 1
+                    record[kind][1] += game["win"]
+    return {kind: tuple(value) for kind, value in record.items()}
+
+
+def record_text(games_wins: tuple[int, int]) -> str:
+    games, wins = games_wins
+    return f"{wins}-{games - wins}" if games else ""
+
+
+def their_picks(player: dict, count: int = THEIR_PICKS) -> list[dict]:
+    """
+    An opponent's likeliest picks: champions with MIN_BAN_TOURNEY_GAMES tournament games
+    first, then by games (tournament games counting TOURNEY_WEIGHT times).
+    """
+    summary = player["summary"]
+    picks = defaultdict(lambda: {"tourney": 0, "soloq": 0})
+    for c in summary["tournament"]:
+        picks[c["champion"]]["tourney"] = c["games"]
+    for c in summary["ranked"]:
+        picks[c["champion"]]["soloq"] = c["games"]
+    ordered = sorted(picks.items(), key=lambda item: (
+        item[1]["tourney"] < MIN_BAN_TOURNEY_GAMES, -(item[1]["tourney"] * TOURNEY_WEIGHT + item[1]["soloq"])))
+    return [{"champion": champion, **counts} for champion, counts in ordered[:count]]
+
+
+def players_by_role(report: dict) -> dict[str, dict]:
+    return {p["summary"]["role"]: p for p in report["players"] if not p.get("error") and p["summary"]["role"]}
+
+
+def matchup_pairs(report: dict, our: list[dict]) -> set[tuple[str, str]]:
+    """The (champion, role) matchup tables a report needs: their likely picks and our main picks."""
+    pairs = set()
+    for role, player in players_by_role(report).items():
+        pairs.update((pick["champion"], role) for pick in their_picks(player))
+    for role in ROLES:
+        pairs.update((champion, role) for champion in role_pool(our, role, OUR_MAIN_PICKS))
+    return pairs
+
+
+def role_answers(report: dict, our: list[dict], tables: dict) -> list[dict]:
+    """
+    For each role: the opponent's likeliest picks there and our best answers from our pool
+    on that role, by OP.GG's matchup win rate (with our own record in that matchup).
+    """
+    result = []
+    for role, player in sorted(players_by_role(report).items(), key=lambda item: ROLES.index(item[0])):
+        pool = role_pool(our, role, OUR_ROLE_POOL)
+        picks = []
+        for pick in their_picks(player):
+            answers = []
+            for champion in pool:
+                matchup = opgg.win_rate(tables, champion, pick["champion"], role) if champion != pick["champion"] else None
+                if matchup and matchup[1] >= MIN_MATCHUP_GAMES:
+                    answers.append({"champion": champion, "wr": matchup[0], "games": matchup[1],
+                                    "ours": our_record(our, role, champion, pick["champion"])})
+            answers.sort(key=lambda a: -a["wr"])
+            picks.append(dict(pick, answers=answers[:ANSWERS_PER_PICK]))
+        result.append({
+            "role": role, "player": player["name"], "picks": picks,
+            "our_players": [m["nick"] for m in our if m["role"] == role],
+        })
+    return result
+
+
+def counters_to_us(report: dict, our: list[dict], tables: dict) -> dict[str, dict]:
+    """
+    Champions that beat what we play most (our OUR_MAIN_PICKS per role, at most COUNTER_WR in
+    a matchup of MIN_COUNTER_GAMES games), the worst matchup each, and whether the opponent
+    on that role plays them.
+    """
+    by_role = players_by_role(report)
+    counters = {}
+    for role in ROLES:
+        player = by_role.get(role)
+        their_pool = {c["champion"] for c in (player["summary"]["ranked"] + player["summary"]["tournament"])} if player else set()
+        for ours in role_pool(our, role, OUR_MAIN_PICKS):
+            for opponent, (games, wins) in tables.get((ours, role), {}).items():
+                wr = wins / games if games else 1
+                if games < MIN_COUNTER_GAMES or wr > COUNTER_WR:
+                    continue
+                if opponent not in counters or wr < counters[opponent]["wr"]:
+                    counters[opponent] = {"vs": ours, "wr": wr, "games": games, "role": role,
+                                          "in_their_pool": opponent in their_pool, "player": player["name"] if player else ""}
+    return counters
 
 
 def draft_guide(path: Path = None) -> str:
@@ -1139,6 +1304,20 @@ def draft_system_prompt() -> str:
     return DRAFT_PROMPT + (f"\n\nWytyczne drużyny:\n{guide}" if guide else "")
 
 
+def answers_facts(report: dict) -> list[str]:
+    lines = ["Nasze odpowiedzi na role (ich pick -> nasz champion: WR matchupu Emerald+ z OP.GG, liczba gier, nasze wyniki):"]
+    for role in report.get("answers", []):
+        for pick in role["picks"]:
+            answers = "; ".join(
+                f"{a['champion']} {pct(a['wr'])} ({a['games']})"
+                + (f", nasze scrimy {record_text(a['ours']['scrims'])}" if a["ours"]["scrims"][0] else "")
+                + (f", nasze SoloQ {record_text(a['ours']['soloq'])}" if a["ours"]["soloq"][0] else "")
+                for a in pick["answers"]
+            ) or "brak danych"
+            lines.append(f"- {role['role']} {pick['champion']} (turnieje {pick['tourney']}, SoloQ {pick['soloq']}) -> {answers}")
+    return lines if len(lines) > 1 else []
+
+
 def summary_facts(report: dict) -> str:
     """The report as compact text for the model."""
     lines = [f"Drużyna przeciwnika: {report['team']}"]
@@ -1150,25 +1329,23 @@ def summary_facts(report: dict) -> str:
             ranked = f"{s['ranked_label']}: {s['ranked_skipped']}"
         else:
             ranked = f"{s['ranked_label']} w ostatnich {s['months']} mies.: {pool_text(s['ranked'], 5)}"
-            if s["recent_months"]:
-                ranked += f"; {s['ranked_label']} w ostatnich {s['recent_months']} mies.: {pool_text(s['recent'], 3)}"
-        accounts = "; ".join(account_text(a, len(player["accounts"]) > 1) for a in player["accounts"])
         lines.append(
-            f"{s['role'] or '?'} {player['name']} ({accounts}): {ranked}; "
-            f"turnieje (kody turniejowe) w ostatnich {s['tourney_months']} mies.: {pool_text(s['tournament'], 5)}"
-            + (f"; one-trick {s['one_trick']['champion']} ({pct(s['one_trick']['share'])} gier)" if s["one_trick"] else "")
+            f"{s['role'] or '?'} {player['name']}: {ranked}; "
+            f"turnieje w ostatnich {s['tourney_months']} mies.: {pool_text(s['tournament'], 5)}"
+            + (f"; one-trick {s['one_trick']['champion']}" if s["one_trick"] else "")
         )
     if report["bans"]:
-        lines.append("Sugerowane bany (z danych): " + ", ".join(f"{b['champion']} ({b['player']}: {b['reason']})" for b in report["bans"]))
+        lines.append("Sugerowane bany: " + "; ".join(
+            f"{b['champion']} [{', '.join(b['tags'])}] {b['reason']}" for b in report["bans"]))
+    lines += answers_facts(report)
     history = report["history"]
     if history["games"]:
         lines.append(
             f"Przeciwko nam: {maps_count(history['games'])}, nasz bilans {history['wins']}-{history['games'] - history['wins']}, "
-            f"grali: {', '.join(c for c, _ in history['picks'].most_common(8))}; "
-            f"banowali: {', '.join(c for c, _ in history['bans'].most_common(5)) or 'brak danych'}"
+            f"grali: {', '.join(c for c, _ in history['picks'].most_common(8))}"
         )
     lines += report.get("our_team", [])
-    lines += meta_facts(report)
+    lines += meta_facts(report)[:12]
     return "\n".join(lines)
 
 
@@ -1226,12 +1403,15 @@ async def run_scouting(team_name: str, riot_ids: list[str], months: int = SCOUT_
             "pro_games": pro["games"],
             "history": await history_against_us(team_name),
         }
-        report["bans"] = ban_suggestions(players)
-        report["our_team"] = await our_team_facts(now_ts * 1000)
+        our = await our_roster_games(now_ts * 1000)
+        tables = await opgg.fetch_many(matchup_pairs(report, our))
+        report["answers"] = role_answers(report, our, tables)
+        report["bans"] = ban_suggestions(players, counters_to_us(report, our, tables), pro["champions"])
+        report["our_team"] = our_team_facts(our)
         report["summary"] = None
         if llm.enabled() and any(p.get("summary") for p in players):
             report["summary"] = await llm.complete(
-                draft_system_prompt(), summary_facts(report), max_tokens=6000, temperature=0.4,
+                draft_system_prompt(), summary_facts(report), max_tokens=3000, temperature=0.3,
                 model=SCOUT_MODEL, latin_only=True, reasoning_effort=SCOUT_REASONING, timeout=300,
             )
         return report
@@ -1265,6 +1445,31 @@ def pro_note(report: dict) -> str:
     return f"pro: gol.gg, patche {', '.join(report['pro_patches'])}"
 
 
+def tag_icons(ban: dict) -> str:
+    return "".join(TAGS[tag] for tag in ban["tags"])
+
+
+def ban_detail(ban: dict) -> str:
+    """Why a champion is a ban: whose comfort pick it is (with games) and what of ours it beats."""
+    parts = []
+    if "komfort" in ban["tags"]:
+        parts.append(f"{ban['player']}: {ban['reason']}")
+    if ban.get("counter"):
+        parts.append(f"kontra: {ban['counter']}")
+    if "meta" in ban["tags"] and ban.get("pro_presence") is not None:
+        parts.append(f"pro P+B {pct(ban['pro_presence'])}")
+    return " · ".join(parts)
+
+
+def answer_line(role: dict) -> str:
+    """"Mid: Viktor → Syndra 52%, Orianna 50%" for the opponent's likeliest pick with answers."""
+    pick = next((p for p in role["picks"] if p["answers"]), None)
+    if not pick:
+        return ""
+    answers = ", ".join(f"{a['champion']} {pct(a['wr'])}" for a in pick["answers"])
+    return f"**{role['role']}**: {pick['champion']} → {answers}"
+
+
 def embed_summary(summary: str | None, limit: int = 2000) -> str | None:
     """The draft plan for the embed: "### " headings as bold, cut at limit with an ellipsis."""
     if not summary:
@@ -1280,6 +1485,15 @@ def embed_with(report: dict, count: int) -> discord.Embed:
         description=embed_summary(report["summary"]),
         timestamp=report["created"],
     )
+    if report["bans"]:
+        embed.add_field(
+            name="🚫 Bany (🎯 komfort · ⚔ kontruje nas · 📈 meta)",
+            value="\n".join(f"{tag_icons(b)} **{b['champion']}** · {ban_detail(b)}" for b in report["bans"][:EMBED_BANS])[:1024],
+            inline=False,
+        )
+    answers = [answer_line(role) for role in report.get("answers", [])]
+    if any(answers):
+        embed.add_field(name="🗡 Nasze odpowiedzi (WR Emerald+)", value="\n".join(a for a in answers if a)[:1024], inline=False)
     for player in report["players"][:10]:
         if player.get("error"):
             embed.add_field(name=player["riot_id"][:256], value=f"⚠ {player['error']}", inline=False)
@@ -1308,12 +1522,6 @@ def embed_with(report: dict, count: int) -> discord.Embed:
             lines.append(f"⚠ One-trick: {s['one_trick']['champion']} ({pct(s['one_trick']['share'])} gier w {s['months']} mies.)")
         embed.add_field(name=name[:256], value="\n".join(lines)[:1024], inline=False)
 
-    if report["bans"]:
-        embed.add_field(
-            name="🚫 Sugerowane bany",
-            value="\n".join(f"**{b['champion']}** ({b['player']}) {b['reason']}" for b in report["bans"][:EMBED_BANS])[:1024],
-            inline=False,
-        )
     history = report["history"]
     if history["games"]:
         embed.add_field(
@@ -1377,26 +1585,47 @@ def build_sheet_rows(report: dict) -> tuple[list[list], dict]:
         f"{pro_note(report)} · konta rozdzielone na 5 graczy (rola z gier, wspólne gry, nazwy, kolejność w linkach)"
     ]))
 
-    add()
-    layout["sections"].append(add((0, ["Sugerowane bany"])))
-    if report["bans"]:
-        add_table(BAN_COLUMNS, [
-            [b["champion"], b["ranked_games"] or "", share(b["ranked_wr"]), b["tourney_games"] or "", share(b["tourney_wr"]),
-             share(b["pro_presence"]), share(b["pro_wr"]), b["role"], b["player"]]
-            for b in report["bans"]
-        ])
-    else:
-        add((0, ["Za mało gier, żeby coś zasugerować"]))
-
     if report["summary"]:
         add()
-        layout["sections"].append(add((0, ["Podsumowanie"])))
+        layout["sections"].append(add((0, ["Najważniejsze"])))
         for line in report["summary"].splitlines():
             line = line.strip().replace("**", "")
             if line.startswith("#"):
                 layout["labels"].append(add((0, [line.lstrip("#").strip()])))
             elif line:
                 add((0, [line]))
+
+    add()
+    layout["sections"].append(add((0, ["Bany (🎯 komfort przeciwnika · ⚔ kontruje to, co gramy · 📈 meta pro)"])))
+    if report["bans"]:
+        add_table(BAN_COLUMNS, [
+            [b["champion"], tag_icons(b), b["ranked_games"] or "", share(b["ranked_wr"]), b["tourney_games"] or "",
+             share(b["tourney_wr"]), share(b["pro_presence"]), b["role"], ban_detail(b)]
+            for b in report["bans"]
+        ])
+    else:
+        add((0, ["Za mało gier, żeby coś zasugerować"]))
+
+    if report.get("answers"):
+        add()
+        layout["sections"].append(add((0, ["Nasze odpowiedzi per rola (WR matchupu z OP.GG, Emerald+; nasze wyniki w tym matchupie)"])))
+        for role in report["answers"]:
+            layout["labels"].append(add((0, [
+                f"{role['role']} · ich gracz: {role['player']} · nasi: {', '.join(role['our_players']) or '-'}"])))
+            header = add((0, [name for name, _ in THEIR_PICK_COLUMNS]), (BLOCK_STARTS[1], [name for name, _ in ANSWER_COLUMNS]))
+            for pick in role["picks"]:
+                first = add((0, [pick["champion"], pick["tourney"] or "", pick["soloq"] or ""]))
+                for i, answer in enumerate(pick["answers"] or [None]):
+                    row = first if i == 0 else add()
+                    grid[row][BLOCK_STARTS[1]:BLOCK_STARTS[1] + len(ANSWER_COLUMNS)] = (
+                        [answer["champion"], share(answer["wr"]), answer["games"], record_text(answer["ours"]["scrims"]),
+                         record_text(answer["ours"]["soloq"])] if answer else ["brak danych", "", "", "", ""]
+                    )
+            layout["tables"] += [
+                (header, len(grid), 0, [kind for _, kind in THEIR_PICK_COLUMNS]),
+                (header, len(grid), BLOCK_STARTS[1], [kind for _, kind in ANSWER_COLUMNS]),
+            ]
+
 
     history = report["history"]
     if history["games"]:
