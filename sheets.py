@@ -180,6 +180,33 @@ class TeamSheet:
         """
         await asyncio.to_thread(self._replace_tab, tab, updates, rows, cols, keep_last)
 
+    def _format_tab(self, tab: str, build_requests) -> None:
+        with self._lock:
+            spreadsheet = self._open()
+            sheet_id = spreadsheet.worksheet(tab).id
+            metadata = spreadsheet.fetch_sheet_metadata(
+                params={"fields": "sheets(properties.sheetId,conditionalFormats)"}
+            )
+            rules = next(
+                (len(sheet.get("conditionalFormats", [])) for sheet in metadata["sheets"]
+                 if sheet["properties"]["sheetId"] == sheet_id),
+                0,
+            )
+            whole = {"sheetId": sheet_id}
+            reset = [{"deleteConditionalFormatRule": {"sheetId": sheet_id, "index": 0}} for _ in range(rules)]
+            reset += [
+                {"unmergeCells": {"range": whole}},
+                {"repeatCell": {"range": whole, "cell": {}, "fields": "userEnteredFormat"}},
+            ]
+            spreadsheet.batch_update({"requests": reset + build_requests(sheet_id)})
+
+    async def format_tab(self, tab: str, build_requests) -> None:
+        """
+        Replace the formatting of a tab written only by the bot (cell formats, merges and
+        conditional colors) with the requests build_requests(sheet_id) returns.
+        """
+        await asyncio.to_thread(self._format_tab, tab, build_requests)
+
     async def write_soloq(self, updates: list[dict], rows: int, cols: int) -> None:
         """Write value ranges to the SoloQ tab (see write)."""
         await self.write(SOLOQ_TAB, updates, rows, cols)
