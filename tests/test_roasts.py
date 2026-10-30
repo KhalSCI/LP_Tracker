@@ -172,7 +172,7 @@ async def play(lp_bot, results: list[bool]) -> list:
     for i, win in enumerate(results):
         data = match_payload(f"EUW1_{i}", now_ms + i * HOUR_MS, win)
         stats = bot_module.riot_api.extract_player_match_stats(data, PUUID)
-        message = SimpleNamespace(reply=AsyncMock(), guild=SimpleNamespace(name="PYRY"))
+        message = SimpleNamespace(id=1000 + i, reply=AsyncMock(), guild=SimpleNamespace(name="PYRY"))
         await lp_bot.comment_on_game(message, PLAYER, data, stats, {PUUID})
         messages.append(message)
     return messages

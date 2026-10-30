@@ -16,14 +16,21 @@ def enabled() -> bool:
 async def complete(system: str, prompt: str, max_tokens: int = 1000, temperature: float = 0.9,
                    model: str = None) -> str | None:
     """The model's reply, or None when there's no key or the request fails (callers fall back)."""
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+    return await chat(messages, max_tokens, temperature, model)
+
+
+async def chat(messages: list[dict], max_tokens: int = 1000, temperature: float = 0.9,
+               model: str = None) -> str | None:
+    """
+    The model's next message in a conversation ({"role", "content"} dicts, system first),
+    or None when there's no key or the request fails.
+    """
     if not OPENROUTER_API_KEY:
         return None
     body = {
         "model": model or OPENROUTER_MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ],
+        "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
         # Short texts don't need thinking; models that always think keep it out of the reply

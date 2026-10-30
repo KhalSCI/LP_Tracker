@@ -250,6 +250,12 @@ class LPTrackerBot(commands.Bot):
 
                         # Mark as notified for this leaderboard
                         await db.mark_match_notified(leaderboard_id, match_id, puuid)
+                        if not match_stats["remake"]:
+                            try:
+                                # Replies to the notification start a conversation about the game (cogs/roasts.py)
+                                await db.create_chat(message.id, match_id, puuid)
+                            except Exception as e:
+                                print(f"Error starting the conversation about {match_id}: {e}")
                         await self.comment_on_game(message, player, match_data, match_stats, tracked_puuids)
 
                         # Small delay to avoid Discord rate limits
@@ -294,7 +300,7 @@ class LPTrackerBot(commands.Bot):
 
             await champions.refresh()
             text = await write_comment(nick, player, stats, trigger, history, lane_opponent(match_data, puuid))
-            await message.reply(
+            reply = await message.reply(
                 f"{mention(user_id, nick)} {text}",
                 mention_author=False,
                 allowed_mentions=discord.AllowedMentions(
@@ -303,16 +309,24 @@ class LPTrackerBot(commands.Bot):
             )
             await db.mark_roasted(match_stats["match_id"], puuid, trigger["kind"])
             print(f"Commented on {player['riot_id']}'s game {match_stats['match_id']}: {trigger['kind']}")
+            chat = await db.get_chat_by_bot_message(message.id)
+            if chat:
+                await db.add_chat_message(chat["id"], reply.id, "comment", text)
         except Exception as e:
             print(f"Error commenting on {player['riot_id']}'s game: {e}")
 
     async def roster_nick(self, player: dict) -> str | None:
         """The player's nick from the roster sheet; None if not in it (e.g. an ex-member)."""
+        entry = await self.roster_entry(player)
+        return entry["nick"] if entry else None
+
+    async def roster_entry(self, player: dict) -> dict | None:
+        """The player's roster row ("nick", "role", ...); None if not in it (e.g. an ex-member)."""
         if not GOOGLE_SHEET_ID:
-            return player.get("discord_name") or player["riot_id"]
+            return {"nick": player.get("discord_name") or player["riot_id"], "role": ""}
         for row in await team_sheet.read_roster_cached():
             if row["riot_id"].lower() == player["riot_id"].lower():
-                return row["nick"] or row["riot_id"]
+                return dict(row, nick=row["nick"] or row["riot_id"])
         return None
 
     @check_match_notifications.before_loop

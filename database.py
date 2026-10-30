@@ -149,6 +149,33 @@ async def init_db():
                 user_id INTEGER PRIMARY KEY
             )
         """)
+        # Conversations with the bot under SoloQ game notifications, one per notification message.
+        # game_card: the game as text for the model, built at the first reply
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS chats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_id TEXT NOT NULL,
+                puuid TEXT NOT NULL,
+                game_card TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Discord messages of these conversations. role: "game" (the notification), "comment"
+        # (the bot's comment on the game), "user" (a reply to the bot) or "assistant" (the bot's answer)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                message_id INTEGER PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                author_id INTEGER,
+                author TEXT,
+                content TEXT NOT NULL DEFAULT '',
+                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_messages_chat ON chat_messages(chat_id)"
+        )
         # Full data of team games (scrims, officials) as the Riot API or LoL client gave it, gzipped JSON
         await db.execute("""
             CREATE TABLE IF NOT EXISTS team_game_raw (
@@ -413,6 +440,17 @@ async def get_player(leaderboard_id: int, riot_id: str) -> dict | None:
         if row:
             return dict(row)
         return None
+
+
+async def get_player_by_puuid(puuid: str) -> dict | None:
+    """Get a tracked player by PUUID (the most recently updated row if on several leaderboards)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM players WHERE puuid = ? ORDER BY last_updated DESC LIMIT 1", (puuid,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
 
 
 async def get_leaderboard_players(leaderboard_id: int) -> list[dict]:
@@ -859,6 +897,16 @@ async def mark_roasted(match_id: str, puuid: str, trigger: str) -> None:
         await db.commit()
 
 
+async def get_roast_triggers_since(puuid: str, since: datetime) -> list[str]:
+    """Triggers of the comments on this player's games posted since a UTC time."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT trigger FROM roasts WHERE puuid = ? AND sent_at >= ? ORDER BY sent_at",
+            (puuid, since.strftime("%Y-%m-%d %H:%M:%S"))
+        )
+        return [row[0] for row in await cursor.fetchall()]
+
+
 async def set_roast_optout(user_id: int, opted_out: bool) -> None:
     """Turn comments on a Discord user's games off (opted_out) or back on."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -874,6 +922,72 @@ async def is_roast_optout(user_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT 1 FROM roast_optout WHERE user_id = ?", (user_id,))
         return await cursor.fetchone() is not None
+
+
+async def create_chat(message_id: int, match_id: str, puuid: str) -> int:
+    """Start a conversation under a game notification message. Returns the chat ID."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "INSERT INTO chats (match_id, puuid) VALUES (?, ?)", (match_id, puuid)
+        )
+        chat_id = cursor.lastrowid
+        await db.execute(
+            "INSERT OR IGNORE INTO chat_messages (message_id, chat_id, role) VALUES (?, ?, 'game')",
+            (message_id, chat_id)
+        )
+        await db.commit()
+        return chat_id
+
+
+async def get_chat_by_bot_message(message_id: int) -> dict | None:
+    """Get the conversation a message of the bot (notification, comment or answer) belongs to."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT chats.* FROM chat_messages JOIN chats ON chats.id = chat_messages.chat_id
+               WHERE chat_messages.message_id = ? AND chat_messages.role != 'user'""",
+            (message_id,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def set_chat_game_card(chat_id: int, game_card: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE chats SET game_card = ? WHERE id = ?", (game_card, chat_id))
+        await db.commit()
+
+
+async def add_chat_message(chat_id: int, message_id: int, role: str, content: str,
+                           author_id: int = None, author: str = None) -> None:
+    """Store a message of a conversation (see chat_messages for the roles)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT OR IGNORE INTO chat_messages (message_id, chat_id, role, author_id, author, content)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (message_id, chat_id, role, author_id, author, content)
+        )
+        await db.commit()
+
+
+async def get_chat_messages(chat_id: int) -> list[dict]:
+    """Get the messages of a conversation, oldest first (Discord message IDs grow with time)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM chat_messages WHERE chat_id = ? ORDER BY message_id", (chat_id,)
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+
+async def count_chat_replies_since(author_id: int, since: datetime) -> int:
+    """Count the bot's answers to a Discord user's replies since a UTC time."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM chat_messages WHERE author_id = ? AND role = 'user' AND sent_at >= ?",
+            (author_id, since.strftime("%Y-%m-%d %H:%M:%S"))
+        )
+        return (await cursor.fetchone())[0]
 
 
 def _pack(data) -> bytes | None:

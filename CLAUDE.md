@@ -47,6 +47,8 @@ pip install -r requirements.txt
 
 - **roasts.py** / **llm.py** / **cogs/roasts.py** - Comments on SoloQ games: `bot.comment_on_game` runs after each SoloQ notification, stores the game in `matches`, and `detect_trigger` picks one trigger (streak milestones, highlight, int, off-pool loss, streak end, night tilt). Text from OpenRouter (`llm.complete`, model in `OPENROUTER_MODEL`) or a template. Only roster players, max `ROASTS_PER_DAY`, `/roast off` opt-out (`roast_optout`).
 
+- **roast_chat.py** - Conversations under SoloQ games: every notification embed starts a row in `chats`, the comment joins it (`chat_messages` maps Discord message IDs to the conversation). A reply to one of the bot's messages there (listener in `cogs/roasts.py`) gets an answer from an edgy coach persona (`llm.chat`) that always sees the game card (match + timeline from the Riot API at the first reply, kept only as text in `chats.game_card`), the player's data from the DB, the comment, and the last `HISTORY_MESSAGES` messages. Roster players only; after `/roast off` only the player can talk; max `CHAT_REPLIES_PER_DAY` per person.
+
 - **members.py** - Roster nick → Discord user ID via `guild.query_members` (no privileged intent), cached in `discord_members`.
 
 - **game_stats.py** - Full data of team games only (never SoloQ): raw API/client JSON + timeline gzipped in `team_game_raw`, per-player stats of both teams in `team_game_stats` (GD/CSD/XPD@10/15 vs lane opponent, KP, shares, vision, early deaths). Roles missing in custom games are inferred from the timeline. Uploader format v2 sends client timelines; `backfill_game_data` fills older games from `uploads/` during the sheet sync. **stats_tab.py** writes them to the bot-only `Statystyki` tab (player/role averages, then lane matchups: our champion vs the enemy one in the same role), every sheet sync and after uploads that add maps or timelines; `replace_tab(keep_last=True)` keeps it the sheet's last tab and `format_tab` rebuilds its formatting (number formats, colors, frozen rows) each time.
@@ -77,4 +79,4 @@ Copy `.env.example` to `.env` and configure:
 - `UPDATE_INTERVAL` - Seconds between auto-updates (default: 3600)
 - `TIMEZONE` - Timezone for timestamps (default: UTC)
 - `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` - LLM for game comments (templates without a key)
-- `AVAILABILITY_HOUR`, `AVAILABILITY_DAYS`, `ROASTS_ENABLED`, `ROASTS_PER_DAY`, `SCOUT_MONTHS`, `SCOUTING_WEB_DIR`, `SCOUTING_WEB_URL` - see `.env.example`
+- `AVAILABILITY_HOUR`, `AVAILABILITY_DAYS`, `ROASTS_ENABLED`, `ROASTS_PER_DAY`, `CHAT_REPLIES_PER_DAY`, `SCOUT_MONTHS`, `SCOUTING_WEB_DIR`, `SCOUTING_WEB_URL` - see `.env.example`

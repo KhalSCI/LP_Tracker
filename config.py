@@ -34,6 +34,8 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-6-luna")
 ROASTS_ENABLED = os.getenv("ROASTS_ENABLED", "1") not in ("0", "false", "False", "")
 ROASTS_PER_DAY = int(os.getenv("ROASTS_PER_DAY", 3))  # per player
+# Replies of the bot per person per day when people reply to its messages under games
+CHAT_REPLIES_PER_DAY = int(os.getenv("CHAT_REPLIES_PER_DAY", 30))
 
 # Opponent scouting: default period of ranked and tournament-code games, in months (/scout offers 3, 6, 12)
 SCOUT_MONTHS = int(os.getenv("SCOUT_MONTHS", 6))
