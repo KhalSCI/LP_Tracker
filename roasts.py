@@ -23,11 +23,15 @@ COMFORT_GAMES = 8
 COMFORT_WR = 0.6
 # Games in the history shown to the model
 HISTORY_FOR_PROMPT = 10
+# Match-v5 teamPosition -> role name
+POSITIONS = {"TOP": "Top", "JUNGLE": "Jungle", "MIDDLE": "Mid", "BOTTOM": "ADC", "UTILITY": "Support"}
+# A support's farm doesn't matter, so it isn't shown to the model
+SUPPORT = "UTILITY"
 
 SYSTEM_PROMPT = """Jesteś złośliwym, ale lubianym kumplem z uczelnianej drużyny League of Legends i piszesz na Discordzie drużyny.
 Dostajesz dane o rankedowej grze kolegi i powód komentarza. Napisz krótki komentarz po polsku: 1-3 zdania, najwyżej 300 znaków.
 Styl: luźny, ironiczny, lekko toksyczny jak na czacie znajomych, gamingowy slang (int, feed, tilt, diff, gap). Pasują teksty w stylu „mój stary by lepiej zagrał tym Aatroxem, zostań przy swojej Camille”.
-Opieraj się wyłącznie na podanych danych, nie wymyślaj statystyk ani zdarzeń. Opis od drużyny to wasze wewnętrzne żarty i ksywki: możesz je czasem wpleść, ale nie cytuj go w całości. Przy złej passie daj konkretną radę z danych: champion z jego puli z dobrym WR, przerwa, sen. Przy dobrej passie ironiczna pochwała.
+Opieraj się wyłącznie na podanych danych, nie wymyślaj statystyk ani zdarzeń. Opis od drużyny to wasze wewnętrzne żarty i ksywki: możesz je czasem wpleść, ale nie cytuj go w całości. Przy złej passie daj konkretną radę z danych: champion z jego puli z dobrym WR, przerwa, sen. Farma supporta się nie liczy, nie komentuj jej. Przy dobrej passie ironiczna pochwała.
 Lekkie przekleństwo może być, ale bez wyzwisk i bez żartów z wyglądu, pochodzenia, zdrowia czy orientacji. Nie zaczynaj od imienia ani pingu gracza (bot doda ping), najwyżej jedno emoji, bez cudzysłowu wokół całości."""
 
 
@@ -175,9 +179,10 @@ def build_prompt(nick: str, player: dict, stats: dict, trigger: dict, history: l
         f"Powód komentarza: {trigger['reason']}",
         (
             f"Ta gra: {'wygrana' if stats['win'] else 'przegrana'} na {champion_display_name(stats['champion_name'])}"
-            f"{' (' + stats['position'].lower() + ')' if stats.get('position') else ''}, "
-            f"KDA {stats['kills']}/{stats['deaths']}/{stats['assists']}, {stats['cs_per_min']} CS/min, "
-            f"{stats['game_duration_minutes']} min"
+            f"{' (' + POSITIONS.get(stats['position'], stats['position']) + ')' if stats.get('position') else ''}, "
+            f"KDA {stats['kills']}/{stats['deaths']}/{stats['assists']}, "
+            + (f"{stats['cs_per_min']} CS/min, " if stats.get("position") != SUPPORT else "")
+            + f"{stats['game_duration_minutes']} min"
             + (f", przeciwnik na linii: {opponent}" if opponent else "")
         ),
         "Ostatnie gry (od najnowszej): " + ", ".join(format_game(g) for g in history[:HISTORY_FOR_PROMPT]),

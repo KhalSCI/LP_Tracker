@@ -110,6 +110,13 @@ class TestGameCard:
         with pytest.raises(ValueError):
             build_game_card(match_payload(), None, "someone-else", "khal")
 
+    def test_no_farm_for_supports(self):
+        card = build_game_card(match_payload(), None, "p5", "drukarz")
+
+        assert "drukarz: Garen (Support), KDA 2/2/2, gold 9.0k" in card
+        assert "Support Garen 2/2/2, 10.0k obrażeń" in card
+        assert "Top Garen 2/2/2, 150 CS, 10.0k obrażeń" in card
+
     def test_vision_for_jungle_and_support(self):
         card = build_game_card(match_payload(), None, "p2", "kuba")
 
@@ -247,6 +254,7 @@ class TestPlayerKnowledge:
 
         assert "Jinx z tej gry to jego jedyna gra tym championem w SoloQ z 30 dni" in text
         assert "wizja/min (jungle i support) 1.00" in text
+        assert "CS/min" not in text
 
     async def test_team_description(self):
         await db.init_db()

@@ -127,6 +127,14 @@ class TestTexts:
 
         assert prompt.startswith("Gracz: khal (bez rangi)\nOpis od drużyny: ADC i kapitan.\nPowód komentarza")
 
+    def test_support_farm_is_left_out(self):
+        games = history(True, True, True, False, champion="Lulu")
+        prompt = build_prompt("drukarz", {"tier": None}, stats_for(games[0], position="UTILITY"),
+                              {"kind": "win_streak", "reason": "3 wygrane z rzędu"}, games, "Nautilus")
+
+        assert "Ta gra: wygrana na Lulu (Support), KDA 5/3/8, 30 min, przeciwnik na linii: Nautilus" in prompt
+        assert "CS/min" not in prompt
+
     def test_template_suggests_the_comfort_pick(self):
         comfort = [game(i % 4 != 0, "Camille", datetime(2026, 10, 20, tzinfo=TIMEZONE) - timedelta(hours=i)) for i in range(10)]
         games = history(False, False, False, champion="Aatrox") + comfort

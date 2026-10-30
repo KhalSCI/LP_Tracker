@@ -15,7 +15,7 @@ from game_stats import (
     timeline_frames, frame_at, participant_frame, frame_cs, deaths_before, patch, EARLY_DEATHS_MINUTES,
 )
 from riot_api import riot_api, RiotAPIError
-from roasts import champion_pool, streak, format_game, is_soloq_game, games_count, plural
+from roasts import champion_pool, streak, format_game, is_soloq_game, games_count, plural, POSITIONS, SUPPORT
 from stats_tab import mean, kda, vision_per_min
 
 # Latest messages of the conversation the model sees; the game card, the player's data and
@@ -29,8 +29,7 @@ RECENT_DAYS = 7
 RECENT_GAMES = 10
 # Profiles of other roster players writing in the conversation
 MAX_AUTHOR_PROFILES = 4
-POSITIONS = {"TOP": "Top", "JUNGLE": "Jungle", "MIDDLE": "Mid", "BOTTOM": "ADC", "UTILITY": "Support"}
-# Wards and vision are only shown (and so only commented on) for these roles
+# Wards and vision are only shown (and so only commented on) for these roles; farm isn't shown for supports
 VISION_POSITIONS = ("JUNGLE", "UTILITY")
 VISION_ROLES = ("Jungle", "Support")
 OBJECTIVES = (
@@ -48,7 +47,7 @@ Jak piszesz:
 - Krótko: 1-3 zdania, do ~300 znaków. Gdy ktoś prosi o diagnozę, analizę albo plan, możesz do ~600 znaków, ale dalej bez wypracowania.
 - Bierzesz JEDNĄ rzecz, która najbardziej rzuca się w oczy (podpowiada ją sekcja „Co się wyróżnia”), i w nią uderzasz. Nie przelatujesz po kolei wszystkich statystyk, najwyżej 2-3 liczby w odpowiedzi.
 - Odpowiadasz na to, o co ktoś pyta (matchup, build, czyja to wina), a nie według własnego szablonu. Nie powtarzasz tematów ani tekstów, które już padły w tej rozmowie.
-- Wizja i wardy to temat tylko dla junglera i supporta. Graczom z topa, mida i ADC nie wypominasz wardów, pinków ani wizji, chyba że sami o to zapytają.
+- Wizja i wardy to temat tylko dla junglera i supporta. Graczom z topa, mida i ADC nie wypominasz wardów, pinków ani wizji, chyba że sami o to zapytają. Farma supporta w ogóle się nie liczy, nie komentuj jej.
 - Piszesz jak dwudziestolatek na polskim Discordzie: potocznie, z gamingowym slangiem (int, feed, diff, gap, tilt, carry, ff) i przekleństwami, z poprawną odmianą („dwa zgony”, „ten stomp”). Bez poetyckich metafor i kalk z angielskiego, bez coachingowych formułek („Następnym razem”, „Konkretnie”, „Kluczem jest”, „Warto”, „Pamiętaj”), bez pogrubień i nagłówków. Listę robisz tylko wtedy, gdy ktoś prosi o plan.
 - Statystyki i zdarzenia bierzesz tylko z danych niżej, niczego nie zmyślasz (replaya nie widziałeś). Ogólną wiedzę o LoL-u (matchupy, buildy, power spiki) możesz dorzucić.
 - Gdy pisze ktoś inny niż gracz z karty, a masz jego profil w sekcji „Kto jeszcze pisze”, możesz mu oddać jego własnymi statami.
@@ -107,12 +106,13 @@ def player_line(p: dict, team: list[dict], minutes: float) -> str:
     challenges = p.get("challenges") or {}
     parts = [
         f"{champion(p)} ({position(p)}), KDA {score(p)}",
-        f"CS {total_cs(p)} ({total_cs(p) / minutes:.1f}/min)",
+        f"CS {total_cs(p)} ({total_cs(p) / minutes:.1f}/min)" if p.get("teamPosition") != SUPPORT else None,
         f"gold {thousands(p.get('goldEarned', 0))}",
         f"obrażenia {thousands(damage(p))} ({percent(damage(p), team_damage)} drużyny)",
         f"KP {percent(p.get('kills', 0) + p.get('assists', 0), team_kills)}",
         f"otrzymane obrażenia {thousands(p.get('totalDamageTaken', 0))}",
     ]
+    parts = [part for part in parts if part]
     if p.get("teamPosition") in VISION_POSITIONS:
         parts.append(f"wizja {p.get('visionScore', 0) / minutes:.2f}/min (wardy {p.get('wardsPlaced', 0)}, "
                      f"zniszczone {p.get('wardsKilled', 0)}, control wardy {p.get('visionWardsBoughtInGame', 0)})")
@@ -130,7 +130,8 @@ def player_line(p: dict, team: list[dict], minutes: float) -> str:
 
 
 def short_line(p: dict) -> str:
-    return f"{position(p)} {champion(p)} {score(p)}, {total_cs(p)} CS, {thousands(damage(p))} obrażeń"
+    farm = f"{total_cs(p)} CS, " if p.get("teamPosition") != SUPPORT else ""
+    return f"{position(p)} {champion(p)} {score(p)}, {farm}{thousands(damage(p))} obrażeń"
 
 
 def by_position(team: list[dict]) -> list[dict]:
@@ -166,7 +167,7 @@ def standouts(me: dict, opponent: dict | None, allies: list[dict], enemies: list
     facts = []
     won = bool(me.get("win"))
     everyone = allies + enemies
-    carries = [p for p in allies if p.get("teamPosition") != "UTILITY"]
+    carries = [p for p in allies if p.get("teamPosition") != SUPPORT]
 
     if me.get("pentaKills"):
         facts.append("pentakill")
@@ -175,7 +176,7 @@ def standouts(me: dict, opponent: dict | None, allies: list[dict], enemies: list
         facts.append(f"najwięcej zgonów w swojej drużynie ({deaths})")
     if damage(me) == max(damage(p) for p in everyone):
         facts.append("najwięcej obrażeń w całej grze")
-    elif me.get("teamPosition") != "UTILITY" and len(carries) > 1 and damage(me) == min(damage(p) for p in carries):
+    elif me.get("teamPosition") != SUPPORT and len(carries) > 1 and damage(me) == min(damage(p) for p in carries):
         facts.append("najmniej obrażeń w drużynie, nie licząc supporta")
     if kda_ratio(me) >= 4 and kda_ratio(me) == max(kda_ratio(p) for p in everyone):
         facts.append(f"najlepsze KDA w grze ({score(me)})")
@@ -200,7 +201,7 @@ def standouts(me: dict, opponent: dict | None, allies: list[dict], enemies: list
             facts.append(f"{round(kill_participation * 100)}% KP, był przy prawie każdym killu")
 
     if opponent:
-        if me.get("teamPosition") != "UTILITY":
+        if me.get("teamPosition") != SUPPORT:
             cs_gap = (total_cs(me) - total_cs(opponent)) / minutes
             if abs(cs_gap) >= 1.5:
                 facts.append(f"{cs_gap:+.1f} CS/min względem rywala z linii")
@@ -288,7 +289,8 @@ def team_games_line(rows: list[dict], riot_id: str, nick: str) -> str | None:
     averages = [
         ("KP", mean([g["kill_participation"] for g in games]), lambda v: f"{round(v * 100)}%"),
         ("udział w obrażeniach", mean([g["damage_share"] for g in games]), lambda v: f"{round(v * 100)}%"),
-        ("CS/min", mean([g["cs_per_min"] for g in games]), lambda v: f"{v:.1f}"),
+        ("CS/min (bez gier na supporcie)", mean([g["cs_per_min"] for g in games if g["role"] != "Support"]),
+         lambda v: f"{v:.1f}"),
         ("wizja/min (jungle i support)", mean([vision_per_min(g) for g in vision_games]), lambda v: f"{v:.2f}"),
         ("GD@15", mean([g["gold_diff_15"] for g in games]), lambda v: f"{v:+.0f}"),
         ("CSD@15", mean([g["cs_diff_15"] for g in games]), lambda v: f"{v:+.0f}"),
