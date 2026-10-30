@@ -60,6 +60,57 @@ async def init_db():
                 FOREIGN KEY (leaderboard_id) REFERENCES leaderboards(id) ON DELETE CASCADE
             )
         """)
+        # Ranked games of tracked players, one row per (match, tracked player)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS matches (
+                match_id TEXT NOT NULL,
+                puuid TEXT NOT NULL,
+                queue_id INTEGER NOT NULL,
+                team_id INTEGER,
+                champion_name TEXT,
+                win BOOLEAN,
+                remake BOOLEAN DEFAULT 0,
+                kills INTEGER,
+                deaths INTEGER,
+                assists INTEGER,
+                game_start INTEGER,
+                game_duration INTEGER,
+                PRIMARY KEY (match_id, puuid)
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_matches_puuid_start ON matches(puuid, game_start)"
+        )
+        # When each player's match history was last fetched
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS match_sync (
+                puuid TEXT PRIMARY KEY,
+                synced_at INTEGER NOT NULL
+            )
+        """)
+        # Rank snapshots, stored only when a player's rank changes
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS rank_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                puuid TEXT NOT NULL,
+                tier TEXT,
+                rank TEXT,
+                lp INTEGER,
+                wins INTEGER,
+                losses INTEGER,
+                recorded_at TIMESTAMP NOT NULL
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rank_history_puuid ON rank_history(puuid, recorded_at)"
+        )
+        # Match reminders already posted, so each is sent once
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS match_reminders (
+                reminder_key TEXT PRIMARY KEY,
+                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         # Migration: Add notifications_enabled_at column if it doesn't exist
         try:
             await db.execute(
@@ -268,7 +319,7 @@ async def update_player_rank(
     losses: int,
     prev_lp: int = None
 ) -> None:
-    """Update a player's rank information."""
+    """Update a player's rank information and record it in the rank history."""
     async with aiosqlite.connect(DB_PATH) as db:
         if prev_lp is not None:
             await db.execute(
@@ -284,7 +335,29 @@ async def update_player_rank(
                    WHERE id = ?""",
                 (tier, rank, lp, wins, losses, datetime.utcnow(), player_id)
             )
+
+        cursor = await db.execute("SELECT puuid FROM players WHERE id = ?", (player_id,))
+        row = await cursor.fetchone()
+        if row and row[0]:
+            await _record_rank_snapshot(db, row[0], (tier, rank, lp, wins, losses))
         await db.commit()
+
+
+async def _record_rank_snapshot(db: aiosqlite.Connection, puuid: str, rank_data: tuple) -> None:
+    """Add a rank_history row unless the player's last snapshot is the same rank."""
+    cursor = await db.execute(
+        """SELECT tier, rank, lp, wins, losses FROM rank_history
+           WHERE puuid = ? ORDER BY id DESC LIMIT 1""",
+        (puuid,)
+    )
+    last = await cursor.fetchone()
+    if last is not None and tuple(last) == tuple(rank_data):
+        return
+    await db.execute(
+        """INSERT INTO rank_history (puuid, tier, rank, lp, wins, losses, recorded_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (puuid, *rank_data, datetime.utcnow())
+    )
 
 
 async def get_all_leaderboards_with_channels() -> list[dict]:
@@ -461,3 +534,121 @@ async def get_guild_settings(guild_id: int) -> dict | None:
         )
         row = await cursor.fetchone()
         return dict(row) if row else None
+
+
+# ============ Team Sheet Functions ============
+
+async def update_player_identity(player_id: int, riot_id: str, discord_name: str) -> None:
+    """Update a player's Riot ID and Discord nick (e.g., after an account rename)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE players SET riot_id = ?, discord_name = ? WHERE id = ?",
+            (riot_id, discord_name, player_id)
+        )
+        await db.commit()
+
+
+async def get_stored_match_ids(puuid: str, match_ids: list[str]) -> set[str]:
+    """Return which of the given match IDs are already stored for this player."""
+    if not match_ids:
+        return set()
+    async with aiosqlite.connect(DB_PATH) as db:
+        placeholders = ",".join("?" * len(match_ids))
+        cursor = await db.execute(
+            f"SELECT match_id FROM matches WHERE puuid = ? AND match_id IN ({placeholders})",
+            (puuid, *match_ids)
+        )
+        rows = await cursor.fetchall()
+        return {row[0] for row in rows}
+
+
+async def save_matches(rows: list[dict]) -> None:
+    """Store match rows (one per match and tracked player), skipping ones already stored."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany(
+            """INSERT OR IGNORE INTO matches
+               (match_id, puuid, queue_id, team_id, champion_name, win, remake,
+                kills, deaths, assists, game_start, game_duration)
+               VALUES (:match_id, :puuid, :queue_id, :team_id, :champion_name, :win, :remake,
+                       :kills, :deaths, :assists, :game_start, :game_duration)""",
+            rows
+        )
+        await db.commit()
+
+
+async def get_match_sync_time(puuid: str) -> int | None:
+    """Get when this player's match history was last fetched (Unix seconds)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT synced_at FROM match_sync WHERE puuid = ?", (puuid,))
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
+async def set_match_sync_time(puuid: str, synced_at: int) -> None:
+    """Record when this player's match history was last fetched (Unix seconds)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO match_sync (puuid, synced_at) VALUES (?, ?)
+               ON CONFLICT(puuid) DO UPDATE SET synced_at = excluded.synced_at""",
+            (puuid, synced_at)
+        )
+        await db.commit()
+
+
+async def get_matches_since(puuids: list[str], since_ms: int) -> list[dict]:
+    """Get stored matches of the given players that started at or after since_ms."""
+    if not puuids:
+        return []
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        placeholders = ",".join("?" * len(puuids))
+        cursor = await db.execute(
+            f"""SELECT * FROM matches
+                WHERE puuid IN ({placeholders}) AND game_start >= ?
+                ORDER BY game_start DESC""",
+            (*puuids, since_ms)
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def get_rank_baseline(puuid: str, at: datetime) -> dict | None:
+    """
+    Get the player's rank as it was at the given UTC time: the last snapshot taken
+    at or before it, or the first one after it if history starts later.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT * FROM rank_history WHERE puuid = ? AND recorded_at <= ?
+               ORDER BY recorded_at DESC LIMIT 1""",
+            (puuid, at)
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            cursor = await db.execute(
+                "SELECT * FROM rank_history WHERE puuid = ? ORDER BY recorded_at LIMIT 1",
+                (puuid,)
+            )
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def is_reminder_sent(reminder_key: str) -> bool:
+    """Check if a match reminder has already been posted."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM match_reminders WHERE reminder_key = ?",
+            (reminder_key,)
+        )
+        return await cursor.fetchone() is not None
+
+
+async def mark_reminder_sent(reminder_key: str) -> None:
+    """Record that a match reminder was posted."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO match_reminders (reminder_key) VALUES (?)",
+            (reminder_key,)
+        )
+        await db.commit()

@@ -7,6 +7,8 @@ Wants=network-online.target
 Type=simple
 User=khal
 WorkingDirectory=/home/khal/LP_Tracker
+# Show print() logs in journalctl right away instead of in buffered bursts
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/khal/LP_Tracker/venv/bin/python bot.py
 Restart=always
 RestartSec=10

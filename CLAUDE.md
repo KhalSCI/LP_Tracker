@@ -39,6 +39,10 @@ pip install -r requirements.txt
 
 - **config.py** - Environment config loaded via python-dotenv. Defines rank/division ordering constants for sorting.
 
+- **sheets.py** / **cogs/sheet.py** - Optional team Google Sheet sync (`update_team_sheet` loop in bot.py, `/sheet sync`). Reads the roster from the `Skład` tab into one leaderboard, stores SoloQ/Flex games in the `matches` table, and writes stats to the `SoloQ` tab. `database.update_player_rank` also records `rank_history` snapshots used for the 7-day LP change. gspread is blocking, so sheet calls run in `asyncio.to_thread`.
+
+- **reminders.py** - Match reminders from the sheet's `Mecze` tab (`check_match_reminders` loop in bot.py): planned matches with the `Przypomnienie` checkbox ticked (columns located by row-4 header names) get pings 24h and 1h before (untimed ones at 18:00 the day before), deduplicated in the `match_reminders` table.
+
 ### Data Flow
 
 1. User adds player via `/player add` -> Riot API lookup -> store puuid + initial rank in SQLite

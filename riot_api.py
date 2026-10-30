@@ -121,7 +121,8 @@ class RiotAPI:
         puuid: str,
         queue: int = 420,
         count: int = 5,
-        start_time: int = None
+        start_time: int = None,
+        start: int = 0
     ) -> list[str]:
         """
         Get recent match IDs for a player.
@@ -131,13 +132,16 @@ class RiotAPI:
             queue: Queue ID (420 = Ranked Solo/Duo, 440 = Flex)
             count: Number of matches to retrieve (max 100)
             start_time: Unix timestamp in seconds - only get matches after this time
+            start: Index of the first match to return, for paging past `count`
 
         Returns:
-            List of match IDs (e.g., ["EUW1_1234567890", ...])
+            List of match IDs, newest first (e.g., ["EUW1_1234567890", ...])
         """
         url = f"{RIOT_ACCOUNT_API}/lol/match/v5/matches/by-puuid/{puuid}/ids?queue={queue}&count={count}"
         if start_time:
             url += f"&startTime={start_time}"
+        if start:
+            url += f"&start={start}"
         return await self._request(url)
 
     async def get_match_details(self, match_id: str) -> dict:
@@ -190,8 +194,11 @@ class RiotAPI:
                     "cs": total_cs,
                     "cs_per_min": cs_per_min,
                     "game_duration_minutes": int(game_duration_minutes),
+                    "game_start_timestamp": info.get("gameStartTimestamp", 0),
                     "game_end_timestamp": info.get("gameEndTimestamp", 0),
                     "queue_id": info.get("queueId", 0),
+                    "team_id": participant.get("teamId", 0),
+                    "remake": participant.get("gameEndedInEarlySurrender", False),
                 }
 
         return None

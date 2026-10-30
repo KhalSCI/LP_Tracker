@@ -300,3 +300,45 @@ class TestRiotAPIHighRanks:
 
             assert result["tier"] == "CHALLENGER"
             assert result["lp"] == 1200
+
+    @pytest.mark.asyncio
+    async def test_get_match_ids_second_page(self, api):
+        """Test that paging past the first results adds the start index."""
+        with aioresponses() as mocked:
+            url = (
+                f"{RIOT_ACCOUNT_API}/lol/match/v5/matches/by-puuid/test-puuid/ids"
+                "?queue=440&count=100&startTime=1700000000&start=100"
+            )
+            mocked.get(url, payload=["EUW1_1"])
+
+            result = await api.get_match_ids_by_puuid(
+                "test-puuid", queue=440, count=100, start_time=1700000000, start=100
+            )
+            await api.close()
+
+            assert result == ["EUW1_1"]
+
+    def test_extract_player_match_stats_team_and_remake(self, api):
+        """Test that match stats include the team, start time and remake flag."""
+        match_data = {
+            "metadata": {"matchId": "EUW1_1"},
+            "info": {
+                "gameStartTimestamp": 1000,
+                "gameEndTimestamp": 2000,
+                "gameDuration": 200,
+                "queueId": 440,
+                "participants": [{
+                    "puuid": "test-puuid",
+                    "teamId": 200,
+                    "win": False,
+                    "gameEndedInEarlySurrender": True,
+                }],
+            },
+        }
+
+        stats = api.extract_player_match_stats(match_data, "test-puuid")
+
+        assert stats["team_id"] == 200
+        assert stats["game_start_timestamp"] == 1000
+        assert stats["remake"] is True
+        assert stats["queue_id"] == 440

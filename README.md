@@ -13,6 +13,7 @@ A Discord bot that tracks League of Legends ranked LP across your friend group. 
 - **Win/loss notifications** — Per-leaderboard match notifications with champion, KDA, CS/min, and game duration
 - **Slash commands** — Full Discord slash command interface with autocomplete
 - **Auto-updates** — Background tasks refresh leaderboards hourly and check for new matches every 5 minutes (configurable)
+- **Team Google Sheet sync** (optional) — Takes the roster from a Google Sheet and writes ranks, weekly activity, LP change, recent champions and games played together back to it
 - **SQLite storage** — Lightweight, no external database needed
 
 ## Requirements
@@ -40,6 +41,40 @@ TIMEZONE=Europe/Warsaw
 ```
 
 `UPDATE_INTERVAL` is how often leaderboards refresh (seconds, default 3600). `NOTIFICATION_INTERVAL` is how often it checks for new matches (seconds, default 300).
+
+### Team Google Sheet (optional)
+
+The bot can keep one leaderboard in sync with a team spreadsheet:
+
+1. In Google Cloud, enable the Google Sheets API, create a service account and download its JSON key. Keep the key outside the repo, by default at `~/.config/lp-tracker/service_account.json` (or point `GOOGLE_APPLICATION_CREDENTIALS` at it).
+2. Share the spreadsheet with the service account's e-mail as Editor.
+3. Add to `.env`:
+
+```env
+GOOGLE_SHEET_ID=the_id_from_the_sheet_url
+SHEET_GUILD_ID=your_discord_server_id
+SHEET_LEADERBOARD=name_of_the_team_leaderboard
+SHEET_SYNC_INTERVAL=3600
+```
+
+Every `SHEET_SYNC_INTERVAL` seconds the bot:
+
+- reads the roster from the `Skład` tab (rows 8–19: A role, B Discord nick, E EUW Riot ID) and makes the leaderboard match it: new Riot IDs are added, removed ones dropped, nicks updated. Rows with a wrong Riot ID or a non-EUW account show an error in the sheet instead. `/player add/remove` on that leaderboard gets overwritten by the sheet; other leaderboards are untouched.
+- fetches the players' SoloQ and Flex games (the last 30 days on the first run, then only new ones).
+- writes the `SoloQ` tab: rank, LP, season W/L, games and W-L in the last 7 days, LP change over 7 days, top 3 SoloQ champions of the last 30 days with winrate, and a table of games where team members played on the same team (SoloQ duo and Flex).
+
+Ranks come from the leaderboard updates, so the team leaderboard needs an auto-update channel. Riot doesn't provide LP history, so the bot records rank snapshots itself; the 7-day LP change is complete one week after the first run.
+
+#### Match reminders
+
+With the sheet configured, the bot also reads the `Mecze` tab every `REMINDER_CHECK_INTERVAL` seconds (default 300) and posts a reminder for each match whose result says "Zaplanowany" and whose `Przypomnienie` checkbox is ticked (columns are found by their row-4 headers: `Data`, `Godz.`, `Typ`, `Przeciwnik`, `Turniej / nazwa`, `Rezultat`, `Przypomnienie`, `Notatki`): 24 hours and 1 hour before the start, or at 18:00 the day before if the match has no time yet. Unticked matches stay in the sheet without reminders, e.g. qualifier dates you may not play. Each reminder is sent once; changing a match's date, time or name schedules new ones.
+
+```env
+REMINDER_ROLE_ID=role_to_ping       # empty = no ping
+REMINDER_CHANNEL_ID=                # empty = the team leaderboard's notification channel
+```
+
+The role is pinged only if it is mentionable or the bot has the "Mention @everyone, @here and All Roles" permission.
 
 Run:
 
@@ -85,6 +120,12 @@ sudo systemctl start lp-tracker
 | `/notifications disable <leaderboard>` | Disable notifications |
 | `/notifications status` | Show notification settings for all leaderboards |
 
+### Team sheet
+
+| Command | Description |
+|---|---|
+| `/sheet sync` | Sync the team Google Sheet now |
+
 ## How it works
 
 The bot runs two background loops:
@@ -93,6 +134,10 @@ The bot runs two background loops:
 
 2. **Match checker** (every 5 min) — Polls recent ranked matches for all tracked players. When a new match is found, it sends a notification embed with the result, champion played, KDA, CS/min, and game duration. Matches are deduplicated per leaderboard to avoid spam.
 
+3. **Team sheet sync** (hourly, only when `GOOGLE_SHEET_ID` is set) — Syncs the roster from the sheet, stores new SoloQ/Flex games, and writes the stats to the sheet (see above).
+
+4. **Match reminders** (every 5 min, only when `GOOGLE_SHEET_ID` is set) — Posts reminders about planned matches from the sheet's `Mecze` tab, pinging the team role.
+
 ## Architecture
 
 ```
@@ -100,9 +145,12 @@ bot.py              — Bot setup, background task loops
 config.py           — Environment config, rank constants
 riot_api.py         — Async Riot API client (account lookup, ranked stats, match history)
 database.py         — SQLite schema, CRUD operations
+sheets.py           — Google Sheets client for the team spreadsheet
+reminders.py        — Match reminder schedule and messages
 cogs/
   tracker.py        — Leaderboard/player slash commands, embed formatting
   notifications.py  — Match notification commands and embeds
+  sheet.py          — Team sheet sync (roster, match history, stats) and /sheet sync
 ```
 
 ## API note

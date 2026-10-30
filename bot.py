@@ -1,13 +1,21 @@
 import asyncio
 import time
+from datetime import datetime
 import discord
 from discord.ext import commands, tasks
 
 import database as db
 from riot_api import riot_api, RiotAPIError
-from config import DISCORD_TOKEN, UPDATE_INTERVAL, NOTIFICATION_INTERVAL
+from sheets import team_sheet
+from config import (
+    DISCORD_TOKEN, UPDATE_INTERVAL, NOTIFICATION_INTERVAL, TIMEZONE,
+    GOOGLE_SHEET_ID, SHEET_SYNC_INTERVAL, SHEET_GUILD_ID, SHEET_LEADERBOARD,
+    REMINDER_CHANNEL_ID, REMINDER_ROLE_ID, REMINDER_CHECK_INTERVAL,
+)
 from cogs.tracker import create_leaderboard_embed
 from cogs.notifications import create_match_notification_embed
+from cogs.sheet import sync_team_sheet
+from reminders import parse_planned_matches, due_reminders, create_reminder_message
 
 # notified_matches records older than this are deleted after each match check
 NOTIFIED_MATCH_RETENTION_DAYS = 7
@@ -33,6 +41,7 @@ class LPTrackerBot(commands.Bot):
         # Load cogs
         await self.load_extension("cogs.tracker")
         await self.load_extension("cogs.notifications")
+        await self.load_extension("cogs.sheet")
 
         # Sync slash commands
         await self.tree.sync()
@@ -41,6 +50,11 @@ class LPTrackerBot(commands.Bot):
         # Start background tasks
         self.update_leaderboards.start()
         self.check_match_notifications.start()
+        if GOOGLE_SHEET_ID:
+            self.update_team_sheet.start()
+            self.check_match_reminders.start()
+        else:
+            print("Team sheet sync and match reminders disabled (GOOGLE_SHEET_ID not set)")
 
     async def on_ready(self):
         print(f"Logged in as {self.user} (ID: {self.user.id})")
@@ -229,6 +243,72 @@ class LPTrackerBot(commands.Bot):
     @check_match_notifications.before_loop
     async def before_match_check(self):
         await self.wait_until_ready()
+
+    @tasks.loop(seconds=SHEET_SYNC_INTERVAL)
+    async def update_team_sheet(self):
+        """Background task to sync the team Google Sheet (roster in, SoloQ stats out)."""
+        print("Syncing team sheet...")
+        try:
+            summary = await sync_team_sheet()
+            print(
+                f"Synced team sheet: {summary['players']} players, "
+                f"{summary['new_games']} new games, {summary['errors']} roster errors"
+            )
+        except Exception as e:
+            print(f"Error syncing team sheet: {e}")
+
+    @update_team_sheet.before_loop
+    async def before_sheet_sync(self):
+        await self.wait_until_ready()
+
+    @tasks.loop(seconds=REMINDER_CHECK_INTERVAL)
+    async def check_match_reminders(self):
+        """Background task to remind about planned matches from the team sheet's "Mecze" tab."""
+        try:
+            channel = await self.get_reminder_channel()
+            if not channel:
+                return
+
+            matches = parse_planned_matches(await team_sheet.read_matches())
+            now = datetime.now(TIMEZONE)
+            allowed_mentions = discord.AllowedMentions(
+                everyone=False,
+                users=False,
+                roles=[discord.Object(REMINDER_ROLE_ID)] if REMINDER_ROLE_ID else False
+            )
+
+            for key, match in due_reminders(matches, now):
+                if await db.is_reminder_sent(key):
+                    continue
+                content, embed = create_reminder_message(match, now, REMINDER_ROLE_ID)
+                await channel.send(content, embed=embed, allowed_mentions=allowed_mentions)
+                await db.mark_reminder_sent(key)
+                print(f"Sent match reminder: {key}")
+        except Exception as e:
+            print(f"Error checking match reminders: {e}")
+
+    @check_match_reminders.before_loop
+    async def before_reminder_check(self):
+        await self.wait_until_ready()
+
+        channel = await self.get_reminder_channel()
+        if not channel:
+            print("Match reminders: no channel found (set REMINDER_CHANNEL_ID or the team notification channel)")
+            return
+        print(f"Match reminders go to #{channel.name}")
+        role = channel.guild.get_role(REMINDER_ROLE_ID) if REMINDER_ROLE_ID else None
+        if REMINDER_ROLE_ID and not role:
+            print(f"Match reminders: role {REMINDER_ROLE_ID} not found in {channel.guild.name}")
+        elif role and not role.mentionable and not channel.permissions_for(channel.guild.me).mention_everyone:
+            print(f"Match reminders: role @{role.name} is not mentionable and the bot can't mention all roles")
+
+    async def get_reminder_channel(self):
+        """The channel for match reminders: REMINDER_CHANNEL_ID, else the team leaderboard's notification channel."""
+        channel_id = REMINDER_CHANNEL_ID
+        if not channel_id:
+            lb = await db.get_leaderboard(SHEET_GUILD_ID, SHEET_LEADERBOARD)
+            channel_id = lb.get("notification_channel_id") if lb else None
+        return self.get_channel(channel_id) if channel_id else None
 
 
 def main():
