@@ -25,7 +25,7 @@ import llm
 import opgg
 from champions import champions
 from cogs.sheet import format_tier, APEX_TIERS, SOLOQ_QUEUE
-from config import TIMEZONE, SCOUT_MONTHS, SCOUT_MODEL, SCOUT_REASONING, GOOGLE_SHEET_ID
+from config import TIMEZONE, SCOUT_MONTHS, SCOUT_MODEL, SCOUT_REASONING, SCOUT_SUMMARY, GOOGLE_SHEET_ID
 from riot_api import riot_api, RiotAPIError
 from roasts import plural, games_count
 from sheet_format import BAND_BACKGROUND, GRAY, grid_range, cell_format, table_format, column_widths
@@ -89,10 +89,13 @@ MIN_MATCHUP_GAMES = 100
 # OUR_MAIN_PICKS per role, scrims counting SCRIM_WEIGHT times), and strong pro-meta champions
 OUR_MAIN_PICKS = 2
 SCRIM_WEIGHT = 3
-COUNTER_WR = 0.47
+COUNTER_WR = 0.46
 MIN_COUNTER_GAMES = 300
-COUNTER_WEIGHT = 10
-IN_THEIR_POOL, NOT_IN_THEIR_POOL = 1.5, 0.6
+# A counter's weight grows with how much they play it: full from COUNTER_FULL_GAMES games
+# (tournament games counting TOURNEY_WEIGHT times), COUNTER_UNPLAYED for champions they don't play
+COUNTER_WEIGHT = 5
+COUNTER_FULL_GAMES = 20
+COUNTER_UNPLAYED = 0.1
 META_PRESENCE = 0.35
 META_BONUS = 0.2
 TAGS = {"komfort": "🎯", "kontruje nas": "⚔", "meta": "📈"}
@@ -100,7 +103,7 @@ TAGS = {"komfort": "🎯", "kontruje nas": "⚔", "meta": "📈"}
 META_FACTS_CHAMPIONS = 25
 META_ROLE_PICKS = 6
 OUR_POOL_DAYS = 30
-OUR_POOL_CHAMPIONS = 6
+OUR_POOL_CHAMPIONS = 8
 # The team's own draft knowledge for the model, kept out of git (draft_guide.example.md is a template
 # to copy; it isn't used itself, as models take its placeholder examples for facts)
 DRAFT_GUIDE = Path(__file__).parent / "draft_guide.md"
@@ -891,7 +894,7 @@ def ban_suggestions(players: list[dict], counters: dict[str, dict] = None, pro_m
     """
     Up to BAN_SUGGESTIONS bans, each with "tags": "komfort" (their comfort picks, scored
     relative to the best one), "kontruje nas" (beats one of our most played champions, see
-    counters_to_us; more when they play it) and "meta" (strong in pro drafts).
+    counters_to_us; weighted by how much they play it) and "meta" (strong in pro drafts).
     """
     comfort = comfort_candidates(players)
     top_score = max((c["score"] for c in comfort), default=1) or 1
@@ -904,7 +907,8 @@ def ban_suggestions(players: list[dict], counters: dict[str, dict] = None, pro_m
         })
         entry["tags"].append("kontruje nas")
         entry["counter"] = f"{counter['vs']} ma {pct(counter['wr'])} ({counter['games']} gier)"
-        entry["points"] += (0.5 - counter["wr"]) * COUNTER_WEIGHT * (IN_THEIR_POOL if counter["in_their_pool"] else NOT_IN_THEIR_POOL)
+        usage = min(1.0, counter["their_games"] / COUNTER_FULL_GAMES) if counter["their_games"] else COUNTER_UNPLAYED
+        entry["points"] += (0.5 - counter["wr"]) * COUNTER_WEIGHT * usage
         if not entry["reason"]:
             entry["reason"] = f"kontruje nas: {entry['counter']}"
     for entry in candidates.values():
@@ -1274,14 +1278,18 @@ def role_answers(report: dict, our: list[dict], tables: dict) -> list[dict]:
 def counters_to_us(report: dict, our: list[dict], tables: dict) -> dict[str, dict]:
     """
     Champions that beat what we play most (our OUR_MAIN_PICKS per role, at most COUNTER_WR in
-    a matchup of MIN_COUNTER_GAMES games), the worst matchup each, and whether the opponent
-    on that role plays them.
+    a matchup of MIN_COUNTER_GAMES games), the worst matchup each, and how much the opponent
+    on that role plays them ("their_games", tournament games counting TOURNEY_WEIGHT times).
     """
     by_role = players_by_role(report)
     counters = {}
     for role in ROLES:
         player = by_role.get(role)
-        their_pool = {c["champion"] for c in (player["summary"]["ranked"] + player["summary"]["tournament"])} if player else set()
+        their_games = Counter()
+        if player:
+            their_games.update({c["champion"]: c["games"] for c in player["summary"]["ranked"]})
+            for c in player["summary"]["tournament"]:
+                their_games[c["champion"]] += c["games"] * TOURNEY_WEIGHT
         for ours in role_pool(our, role, OUR_MAIN_PICKS):
             for opponent, (games, wins) in tables.get((ours, role), {}).items():
                 wr = wins / games if games else 1
@@ -1289,7 +1297,7 @@ def counters_to_us(report: dict, our: list[dict], tables: dict) -> dict[str, dic
                     continue
                 if opponent not in counters or wr < counters[opponent]["wr"]:
                     counters[opponent] = {"vs": ours, "wr": wr, "games": games, "role": role,
-                                          "in_their_pool": opponent in their_pool, "player": player["name"] if player else ""}
+                                          "their_games": their_games[opponent], "player": player["name"] if player else ""}
     return counters
 
 
@@ -1409,7 +1417,7 @@ async def run_scouting(team_name: str, riot_ids: list[str], months: int = SCOUT_
         report["bans"] = ban_suggestions(players, counters_to_us(report, our, tables), pro["champions"])
         report["our_team"] = our_team_facts(our)
         report["summary"] = None
-        if llm.enabled() and any(p.get("summary") for p in players):
+        if SCOUT_SUMMARY and llm.enabled() and any(p.get("summary") for p in players):
             report["summary"] = await llm.complete(
                 draft_system_prompt(), summary_facts(report), max_tokens=3000, temperature=0.3,
                 model=SCOUT_MODEL, latin_only=True, reasoning_effort=SCOUT_REASONING, timeout=300,

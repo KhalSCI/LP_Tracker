@@ -37,10 +37,10 @@ h2 { font-size:18px; margin:34px 0 12px; padding-bottom:6px; border-bottom:1px s
 .icon { width:28px; height:28px; border-radius:6px; vertical-align:middle; background:var(--surface2); flex:none; }
 .icon.big { width:44px; height:44px; border-radius:8px; }
 .bans { display:grid; grid-template-columns:repeat(auto-fill,minmax(225px,1fr)); gap:10px; }
-.ban { display:flex; gap:10px; align-items:flex-start; padding:12px; } .ban .icon.big { width:38px; height:38px; }
+.ban { padding:12px; } .ban-head { display:flex; gap:10px; align-items:center; margin-bottom:4px; } .ban-head > div { min-width:0; } .ban .icon.big { width:38px; height:38px; }
 .ban b { display:block; font-size:16px; } .who { color:var(--muted); font-size:13px; }
-.line { font-size:13px; margin-top:3px; display:flex; gap:6px; align-items:baseline; white-space:nowrap; }
-.line .lbl { color:var(--muted); min-width:54px; }
+.line { font-size:13px; margin-top:3px; display:flex; gap:6px; align-items:baseline; }
+.line .lbl { color:var(--muted); min-width:54px; flex:none; white-space:nowrap; }
 .player { margin-bottom:16px; padding:0; overflow:hidden; }
 .player > header { padding:12px 16px; background:var(--surface2); border-bottom:1px solid var(--border); }
 .player h3 { display:inline; font-size:18px; margin:0 8px 0 0; }
@@ -213,18 +213,18 @@ def ban_card(ban: dict) -> str:
     tags = "".join(f'<span class="tag {TAG_CLASSES[t]}">{TAG_LABELS[t]}</span>' for t in ban["tags"])
     lines = ""
     if ban["ranked_games"]:
-        lines += f'<div class="line"><span class="lbl">SoloQ</span>{games_count(ban["ranked_games"])} · {wr_cell(ban["ranked_wr"])}</div>'
+        lines += f'<div class="line"><span class="lbl">SoloQ</span><span>{games_count(ban["ranked_games"])} · {wr_cell(ban["ranked_wr"])}</span></div>'
     if ban["tourney_games"]:
-        lines += f'<div class="line"><span class="lbl">Turnieje</span>{games_count(ban["tourney_games"])} · {wr_cell(ban["tourney_wr"])}</div>'
+        lines += f'<div class="line"><span class="lbl">Turnieje</span><span>{games_count(ban["tourney_games"])} · {wr_cell(ban["tourney_wr"])}</span></div>'
     if ban.get("counter"):
-        lines += f'<div class="line"><span class="lbl">Kontra</span>{escape(ban["counter"])}</div>'
+        lines += f'<div class="line"><span class="lbl">Kontra</span><span>{escape(ban["counter"])}</span></div>'
     if ban.get("pro_presence") is not None:
         turn = f' · tura bana ~{ban["pro_ban_turn"]:.0f}' if ban.get("pro_ban_turn") else ""
-        lines += f'<div class="line"><span class="lbl">Pro P+B</span>{scouting.pct(ban["pro_presence"])}{turn}</div>'
+        lines += f'<div class="line"><span class="lbl">Pro P+B</span><span>{scouting.pct(ban["pro_presence"])}{turn}</span></div>'
     who = " · ".join(part for part in (ban["player"], ban["role"]) if part)
     return (
-        f'<div class="card ban">{icon(ban["champion"], big=True)}<div><b>{escape(ban["champion"])}</b>'
-        f'<span class="who">{escape(who)}</span><div class="tags">{tags}</div>{lines}</div></div>'
+        f'<div class="card ban"><div class="ban-head">{icon(ban["champion"], big=True)}<div><b>{escape(ban["champion"])}</b>'
+        f'<span class="who">{escape(who)}</span></div></div><div class="tags">{tags}</div>{lines}</div>'
     )
 
 

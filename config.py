@@ -42,6 +42,8 @@ SCOUT_MONTHS = int(os.getenv("SCOUT_MONTHS", 6))
 # The draft plan in scouting reports uses a stronger model than the game comments (it's rare) with some thinking
 SCOUT_MODEL = os.getenv("SCOUT_MODEL", "anthropic/claude-sonnet-5.5")
 SCOUT_REASONING = os.getenv("SCOUT_REASONING", "medium")
+# The three short points at the top of a scouting report (0 = data only)
+SCOUT_SUMMARY = os.getenv("SCOUT_SUMMARY", "1") not in ("0", "false", "False", "")
 
 # Scouting reports as HTML pages: folder a web server serves and its public URL (both empty = off)
 SCOUTING_WEB_DIR = os.getenv("SCOUTING_WEB_DIR", "")

@@ -283,7 +283,7 @@ class TestAnswers:
         counters = scouting.counters_to_us(report, self.our_mid(), self.tables())
 
         assert set(counters) == {"Kassadin"}  # beats our Syndra at 45% over 600 games; Fizz has too few
-        assert counters["Kassadin"]["vs"] == "Syndra" and not counters["Kassadin"]["in_their_pool"]
+        assert counters["Kassadin"]["vs"] == "Syndra" and counters["Kassadin"]["their_games"] == 0
 
         pro = {"viktor": {"presence": 0.5, "wr": 0.5, "ban_turn": 3.0}}
         bans = ban_suggestions(report["players"], counters, pro)
