@@ -156,7 +156,7 @@ class TeamSheet:
         """Add a tab with initial values (e.g. headers) unless it exists. Returns True if it was added."""
         return await asyncio.to_thread(self._create_tab, tab, updates, rows, cols, frozen_rows)
 
-    def _replace_tab(self, tab: str, updates: list[dict], rows: int, cols: int) -> None:
+    def _replace_tab(self, tab: str, updates: list[dict], rows: int, cols: int, keep_last: bool) -> None:
         with self._lock:
             spreadsheet = self._open()
             try:
@@ -167,13 +167,18 @@ class TeamSheet:
             if worksheet.row_count < rows or worksheet.col_count < cols:
                 worksheet.resize(rows=max(rows, worksheet.row_count), cols=max(cols, worksheet.col_count))
             worksheet.batch_update(updates, value_input_option="RAW")
+            if keep_last:
+                last = len(spreadsheet.worksheets(exclude_hidden=False)) - 1
+                if worksheet.index != last:
+                    worksheet.update_index(last)
 
-    async def replace_tab(self, tab: str, updates: list[dict], rows: int, cols: int) -> None:
+    async def replace_tab(self, tab: str, updates: list[dict], rows: int, cols: int, keep_last: bool = False) -> None:
         """
         Clear a tab written only by the bot (creating it if missing) and write value
-        ranges to it, growing it to at least rows x cols.
+        ranges to it, growing it to at least rows x cols. With keep_last the tab is
+        moved to the end when other tabs were added after it.
         """
-        await asyncio.to_thread(self._replace_tab, tab, updates, rows, cols)
+        await asyncio.to_thread(self._replace_tab, tab, updates, rows, cols, keep_last)
 
     async def write_soloq(self, updates: list[dict], rows: int, cols: int) -> None:
         """Write value ranges to the SoloQ tab (see write)."""

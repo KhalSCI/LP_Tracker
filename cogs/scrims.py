@@ -7,6 +7,7 @@ from discord.ext import commands
 
 from config import SHEET_GUILD_ID
 from team_games import ingest_client_upload, format_summary
+from stats_tab import update_stats_tab
 
 # File name the Windows script uploads through a Discord webhook
 UPLOAD_FILENAME = "lp-tracker-scrims.json"
@@ -29,6 +30,7 @@ class ScrimsCog(commands.Cog):
         if attachment is None:
             return
 
+        summary = None
         try:
             raw = await attachment.read()
             UPLOADS_DIR.mkdir(exist_ok=True)
@@ -40,6 +42,13 @@ class ScrimsCog(commands.Cog):
             text = f"❌ Nie udało się dodać gier: {e}"
             print(f"Error processing scrim upload: {e}")
         await message.reply(text, mention_author=False)
+
+        # New maps or timelines change the stats, so the tab is refreshed now instead of within the hour
+        if summary and (summary["added"] or summary.get("timelines_added")):
+            try:
+                await update_stats_tab()
+            except Exception as e:
+                print(f"Error updating stats after an upload: {e}")
 
 
 async def setup(bot: commands.Bot):

@@ -21,6 +21,7 @@ from team_games import sync_official_games, SCRIM_TYPE
 import scouting
 from game_stats import backfill_game_data
 from drafts import update_drafts_tab
+from stats_tab import update_stats_tab
 from availability import AVAILABILITY_TAB, find_missing_availability, create_availability_message
 from members import find_member_id, mention
 from champions import champions
@@ -350,6 +351,11 @@ class LPTrackerBot(commands.Bot):
             print(f"Updated drafts from {maps} maps")
         except Exception as e:
             print(f"Error updating drafts: {e}")
+
+        try:
+            await update_stats_tab()
+        except Exception as e:
+            print(f"Error updating stats: {e}")
 
     @update_team_sheet.before_loop
     async def before_sheet_sync(self):
