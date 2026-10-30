@@ -4,6 +4,7 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import aiohttp
 import gspread
 import pytest
 from aioresponses import aioresponses
@@ -156,6 +157,30 @@ class TestProMeta:
         assert (table["orianna"]["ban_turn"], table["orianna"]["pick_round"]) == (2.5, 1.4)
         assert table["nunu"]["ban_turn"] is None
 
+    async def test_dropped_connection_tried_again(self, monkeypatch):
+        monkeypatch.setattr(scouting, "_pro_meta_cache", {})
+        monkeypatch.setattr(scouting, "GOLGG_DELAY", 0)
+        monkeypatch.setattr(scouting, "GOLGG_RETRY_DELAY", 0)
+        url = scouting.GOLGG_URL.format(season=16)
+        with aioresponses() as mocked:
+            mocked.get(url, exception=aiohttp.ServerDisconnectedError())
+            mocked.get(url, body=GOLGG_HTML)
+            mocked.post(url, exception=aiohttp.ClientOSError(111, "Connection refused"))
+            for _ in range(3 * 6):
+                mocked.post(url, body=GOLGG_HTML)
+
+            meta = await scouting.fetch_pro_meta(2026)
+
+        assert meta["patches"] == ["16.20", "16.18", "16.17"] and meta["champions"]["orianna"]["picks"] == 18
+
+    async def test_connection_dropped_every_time(self, monkeypatch):
+        monkeypatch.setattr(scouting, "_pro_meta_cache", {})
+        monkeypatch.setattr(scouting, "GOLGG_RETRY_DELAY", 0)
+        with aioresponses() as mocked:
+            for _ in range(scouting.GOLGG_TRIES):
+                mocked.get(scouting.GOLGG_URL.format(season=16), exception=aiohttp.ServerDisconnectedError())
+            assert await scouting.fetch_pro_meta(2026) == scouting.EMPTY_PRO_META
+
     async def test_unavailable(self, monkeypatch):
         monkeypatch.setattr(scouting, "_pro_meta_cache", {})
         with aioresponses() as mocked:
@@ -201,25 +226,28 @@ class TestDraftContext:
             {"riot_id": "Mid#EUW", "nick": "iym", "role": "Mid", "puuid": "m"},
             {"riot_id": "Top#EUW", "nick": "drewin", "role": "Top", "puuid": "t"},
             {"riot_id": "Old#EUW", "nick": "ex", "role": None, "puuid": "o"},
+            {"riot_id": "Sub#EUW", "nick": "kizi", "role": "Top", "puuid": "s"},
         ])))
         monkeypatch.setattr(scouting.team_sheet, "read_roster_cached", AsyncMock(return_value=[
-            {"riot_id": "Mid#EUW", "status": "Main"}, {"riot_id": "Top#EUW", "status": "Próba"}]))
+            {"riot_id": "Mid#EUW", "status": "Main"}, {"riot_id": "Top#EUW", "status": " main "},
+            {"riot_id": "Sub#EUW", "status": "Próba"}]))
         soloq = [{"puuid": "m", "queue_id": 420, "remake": False, "champion_name": "Ahri", "win": w} for w in (1, 1, 0)]
         soloq.append({"puuid": "m", "queue_id": 440, "remake": False, "champion_name": "Zed", "win": 1})
         monkeypatch.setattr(scouting.db, "get_matches_since", AsyncMock(return_value=soloq))
         monkeypatch.setattr(scouting.db, "get_team_game_stats", AsyncMock(return_value=[
             {"ours": True, "player": "drewin", "champion": "Aatrox", "win": True, "lane_opponent": "Gnar"},
+            {"ours": True, "player": "kizi", "champion": "Gwen", "win": True, "lane_opponent": "Gnar"},
             {"ours": False, "player": "E#1", "champion": "Jax", "win": False, "lane_opponent": "Aatrox"}]))
 
         our = await scouting.our_roster_games(NOW * 1000)
         lines = scouting.our_team_facts(our)
 
-        assert [m["nick"] for m in our] == ["drewin", "iym"]
+        assert [m["nick"] for m in our] == ["drewin", "iym"]  # kizi is on trial, so not in our pool
         assert our[1]["soloq"][0] == {"champion": "Ahri", "opponent": None, "win": True}
         assert lines == [
-            "Nasza drużyna (role ze Składu):",
-            "- Top drewin (Próba): SoloQ 30 dni: brak; scrimy i oficjale: Aatrox 1 (100%)",
-            "- Mid iym (Main): SoloQ 30 dni: Ahri 3 (67%); scrimy i oficjale: brak",
+            "Nasza drużyna (skład Main, role ze Składu):",
+            "- Top drewin: SoloQ 30 dni: brak; scrimy i oficjale: Aatrox 1 (100%)",
+            "- Mid iym: SoloQ 30 dni: Ahri 3 (67%); scrimy i oficjale: brak",
         ]
 
     def test_embed_summary(self):
@@ -232,7 +260,7 @@ def our_member(nick: str, role: str, scrims=(), soloq=()) -> dict:
     """Our roster player with games given as (champion, opponent, win)."""
     def games_of(items):
         return [{"champion": c, "opponent": o, "win": w} for c, o, w in items]
-    return {"nick": nick, "role": role, "status": "Main", "scrims": games_of(scrims), "soloq": games_of(soloq)}
+    return {"nick": nick, "role": role, "scrims": games_of(scrims), "soloq": games_of(soloq)}
 
 
 class TestAnswers:

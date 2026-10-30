@@ -25,6 +25,7 @@ import llm
 import opgg
 from champions import champions
 from cogs.sheet import format_tier, APEX_TIERS, SOLOQ_QUEUE
+from availability import MAIN_STATUS
 from config import TIMEZONE, SCOUT_MONTHS, SCOUT_MODEL, SCOUT_REASONING, SCOUT_SUMMARY, GOOGLE_SHEET_ID
 from riot_api import riot_api, RiotAPIError
 from roasts import plural, games_count
@@ -76,6 +77,9 @@ EMPTY_PRO_META = {"patches": [], "games": 0, "champions": {}}
 # gol.gg's role filter values; each patch is read once for all roles and once per role
 GOLGG_ROLES = {"TOP": "Top", "JUNGLE": "Jungle", "MID": "Mid", "ADC": "ADC", "SUPPORT": "Support"}
 GOLGG_DELAY = 0.5
+# gol.gg's server sometimes drops a connection; such a request is tried again after a pause
+GOLGG_TRIES = 3
+GOLGG_RETRY_DELAY = 5
 # A champion is a flex pick when another role has at least this share of its pro picks
 FLEX_SHARE = 0.2
 FLEX_MIN_PICKS = 5
@@ -362,6 +366,20 @@ def combine_pro_tables(tables: list[dict], role_tables: dict[str, list[dict]] = 
     return champions, games
 
 
+async def golgg_page(session: aiohttp.ClientSession, method: str, url: str, **kwargs) -> str:
+    """A gol.gg page, asked for again (up to GOLGG_TRIES times) when the connection drops."""
+    for attempt in range(1, GOLGG_TRIES + 1):
+        try:
+            async with session.request(method, url, **kwargs) as response:
+                response.raise_for_status()
+                return await response.text()
+        except aiohttp.ClientConnectionError as e:
+            if attempt == GOLGG_TRIES:
+                raise
+            print(f"gol.gg dropped the connection ({e}), trying again")
+            await asyncio.sleep(GOLGG_RETRY_DELAY)
+
+
 async def fetch_pro_meta(season: int) -> dict:
     """
     Pro-play champion stats of the season's last PRO_META_PATCHES patches from gol.gg, cached
@@ -377,16 +395,12 @@ async def fetch_pro_meta(season: int) -> dict:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=300), headers={"User-Agent": "LP-Tracker (team Discord bot)"}
         ) as session:
-            async with session.get(url) as response:
-                response.raise_for_status()
-                patches = parse_patches(await response.text())[:PRO_META_PATCHES]
+            patches = parse_patches(await golgg_page(session, "GET", url))[:PRO_META_PATCHES]
             tables, role_tables = [], defaultdict(list)
             for patch in patches:
                 for golgg_role in ("ALL", *GOLGG_ROLES):
                     await asyncio.sleep(GOLGG_DELAY)
-                    async with session.post(url, data={"patch": patch, "role": golgg_role}) as response:
-                        response.raise_for_status()
-                        table = parse_champion_table(await response.text())
+                    table = parse_champion_table(await golgg_page(session, "POST", url, data={"patch": patch, "role": golgg_role}))
                     if golgg_role == "ALL":
                         tables.append(table)
                     else:
@@ -1138,20 +1152,21 @@ def champion_counts(games: list[tuple[str, bool]], count: int) -> str:
 
 async def our_roster_games(now_ms: int) -> list[dict]:
     """
-    Our roster players with a role (from "Skład") and their games: {"nick", "role", "status",
-    "scrims", "soloq"}, games as {"champion", "opponent", "win"} (scrims and officials, then
-    SoloQ of the last OUR_POOL_DAYS days), champions by display name.
+    Our Main roster players with a role (from "Skład"; trial and sub players are left out) and
+    their games: {"nick", "role", "scrims", "soloq"}, games as {"champion", "opponent", "win"}
+    (scrims and officials, then SoloQ of the last OUR_POOL_DAYS days), champions by display name.
     """
     if not GOOGLE_SHEET_ID:
         return []
     from team_games import load_team_roster  # team_games is only needed here
     try:
         roster = await load_team_roster()
-        statuses = {row["riot_id"].lower(): row["status"] for row in await team_sheet.read_roster_cached()}
+        main = {row["riot_id"].lower() for row in await team_sheet.read_roster_cached()
+                if row["status"].strip().lower() == MAIN_STATUS}
     except Exception as e:
         print(f"Scouting: could not read our roster: {e}")
         return []
-    members = [m for m in roster.members if m.get("role") and m["riot_id"].lower() in statuses]
+    members = [m for m in roster.members if m.get("role") and m["riot_id"].lower() in main]
     members.sort(key=lambda m: ROLES.index(m["role"]))
     soloq = await db.get_matches_since([m["puuid"] for m in members if m.get("puuid")], now_ms - OUR_POOL_DAYS * DAY_MS)
     team_rows = [r for r in await db.get_team_game_stats() if r["ours"]]
@@ -1159,7 +1174,6 @@ async def our_roster_games(now_ms: int) -> list[dict]:
         {
             "nick": member["nick"],
             "role": member["role"],
-            "status": statuses[member["riot_id"].lower()],
             "scrims": [{"champion": r["champion"], "opponent": r["lane_opponent"], "win": bool(r["win"])}
                        for r in team_rows if r["player"] == member["nick"]],
             "soloq": [
@@ -1177,12 +1191,12 @@ def our_team_facts(our: list[dict]) -> list[str]:
     """Our players' pools as text for the model."""
     if not our:
         return []
-    lines = ["Nasza drużyna (role ze Składu):"]
+    lines = ["Nasza drużyna (skład Main, role ze Składu):"]
     for member in our:
         solo = [(g["champion"], g["win"]) for g in member["soloq"]]
         team = [(g["champion"], g["win"]) for g in member["scrims"]]
         lines.append(
-            f"- {member['role']} {member['nick']} ({member['status'] or 'skład'}): "
+            f"- {member['role']} {member['nick']}: "
             f"SoloQ {OUR_POOL_DAYS} dni: {champion_counts(solo, OUR_POOL_CHAMPIONS)}; "
             f"scrimy i oficjale: {champion_counts(team, OUR_POOL_CHAMPIONS)}"
         )
