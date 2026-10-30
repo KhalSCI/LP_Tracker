@@ -15,7 +15,7 @@ A Discord bot that tracks League of Legends ranked LP across your friend group. 
 - **Slash commands** — Full Discord slash command interface with autocomplete
 - **Auto-updates** — Background tasks refresh leaderboards hourly and check for new matches every 5 minutes (configurable)
 - **Team Google Sheet sync** (optional) — Takes the roster from a Google Sheet and writes ranks, weekly activity, LP change, recent champions and games played together back to it; reminds about matches and missing availability, and keeps full data of scrims and officials
-- **Opponent scouting** — `/scout` (and automatically the day before an official) reports each opponent's champions this and last season with games and winrate, tournament games, suggested bans and pro-play priority from gol.gg
+- **Opponent scouting** — `/scout` (and automatically the day before an official) reports each opponent's champions this and last season with games and winrate, tournament-code games, suggested bans and pro-play priority from gol.gg
 - **SQLite storage** — Lightweight, no external database needed
 
 ## Requirements
@@ -98,7 +98,7 @@ The Riot API doesn't return regular custom games, so scrims come from the LoL cl
 
 - rank (SoloQ and Flex) and main role,
 - champions in ranked this season and last season (up to `SCOUT_MAX_GAMES` newest games per season, default 100) with games, W/L, winrate and KDA,
-- champions in tournament-code games (`type=tourney` in match-v5: only games of that account, and only when the organizer used Riot tournament codes) and Clash games (queue 700, fetched separately since `tourney` doesn't include them),
+- champions in tournament-code games (`type=tourney` in match-v5: only games of that account, and only when the organizer used Riot tournament codes; Clash isn't included),
 - one-trick warnings,
 
 plus suggested bans (comfort picks by games and smoothed winrate, tournament games count triple), what the team picked and banned against us, pro-play priority and winrate of each champion from [gol.gg](https://gol.gg) (current season, all tournaments, cached for a day), and with an OpenRouter key a short summary. The embed goes to the channel and the full tables to the bot-only `Scouting` tab (overwritten by each scouting). Games are cached in `scout_games`, so the first scouting of a team can take 15–20 minutes because of the Riot API rate limit, and later ones only fetch new games. When the 24-hour (or day-before) reminder of an official (any type but Scrim) is posted and the opponent's players are known, the bot scouts it automatically and posts the report under the reminder.
