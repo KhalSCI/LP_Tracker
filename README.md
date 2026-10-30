@@ -59,7 +59,7 @@ SHEET_SYNC_INTERVAL=3600
 
 Every `SHEET_SYNC_INTERVAL` seconds the bot:
 
-- reads the roster from the `Skład` tab (rows 8–19: A role, B Discord nick, E EUW Riot ID) and makes the leaderboard match it: new Riot IDs are added, removed ones dropped, nicks updated. Rows with a wrong Riot ID or a non-EUW account show an error in the sheet instead. `/player add/remove` on that leaderboard gets overwritten by the sheet; other leaderboards are untouched.
+- reads the roster from the `Skład` tab (rows 8–19: A role, B Discord nick, E EUW Riot ID) and adds new Riot IDs to the leaderboard and updates nicks. Players removed from the sheet stay on the leaderboard (e.g. ex-teammates still followed there) until removed with `/player remove`. Rows with a wrong Riot ID or a non-EUW account show an error in the sheet instead.
 - fetches the players' SoloQ and Flex games (the last 30 days on the first run, then only new ones).
 - writes the `SoloQ` tab: rank, LP, season W/L, games and W-L in the last 7 days, LP change over 7 days, top 3 SoloQ champions of the last 30 days with winrate, and a table of games where team members played on the same team (SoloQ duo and Flex).
 
@@ -75,6 +75,15 @@ REMINDER_CHANNEL_ID=                # empty = the team leaderboard's notificatio
 ```
 
 The role is pinged only if it is mentionable or the bot has the "Mention @everyone, @here and All Roles" permission.
+
+#### Scrims, officials and drafts
+
+The Riot API doesn't return regular custom games, so scrims come from the LoL client:
+
+- `uploader/` holds a Windows script (PowerShell, nothing to install). After scrims, a player runs `Wyslij scrimy.cmd` (or leaves `Wysylaj automatycznie.cmd` running): it reads recent custom games from the LoL client's local API and posts them as `lp-tracker-scrims.json` through a Discord webhook. See `uploader/INSTRUKCJA.txt`.
+- The bot takes webhook messages with that file in the team server, recognizes our team (3+ of our players on one side, by Riot ID), and appends one row per map to the `Mapy` tab: result, side, players and champions per role, enemy picks and game ID. Each map is linked to that day's scrim in `Mecze` (or a new scrim row is added). Games are deduplicated by game ID in the database and the sheet, so sending the same games again changes nothing.
+- Officials played with tournament codes are in the Riot API: every sheet sync the bot looks up our players' tournament games from the last 14 days and adds those that match an official in `Mecze` that day.
+- The `Drafty` tab is rebuilt every sync from `Mapy`: our champions per player (scrim/official record and SoloQ winrate), enemy champions we faced, bot lane and jungle-mid pairs, side winrate, and bans against us.
 
 Run:
 
@@ -147,6 +156,10 @@ riot_api.py         — Async Riot API client (account lookup, ranked stats, mat
 database.py         — SQLite schema, CRUD operations
 sheets.py           — Google Sheets client for the team spreadsheet
 reminders.py        — Match reminder schedule and messages
+team_games.py       — Scrims (client uploads) and officials (Riot API) into Mecze/Mapy
+drafts.py           — Drafty tab analysis
+champions.py        — Champion names from Data Dragon
+uploader/           — Windows script that sends scrims from the LoL client
 cogs/
   tracker.py        — Leaderboard/player slash commands, embed formatting
   notifications.py  — Match notification commands and embeds

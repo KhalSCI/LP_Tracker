@@ -41,6 +41,8 @@ pip install -r requirements.txt
 
 - **sheets.py** / **cogs/sheet.py** - Optional team Google Sheet sync (`update_team_sheet` loop in bot.py, `/sheet sync`). Reads the roster from the `Skład` tab into one leaderboard, stores SoloQ/Flex games in the `matches` table, and writes stats to the `SoloQ` tab. `database.update_player_rank` also records `rank_history` snapshots used for the 7-day LP change. gspread is blocking, so sheet calls run in `asyncio.to_thread`.
 
+- **team_games.py** / **cogs/scrims.py** / **drafts.py** - Team games: scrims arrive as `lp-tracker-scrims.json` from webhook messages (Windows script in `uploader/` reading the LoL client's local API; regular custom games aren't in the Riot API), officials (tournament codes) are fetched from the Riot API during the sheet sync. Games are normalized to one dict format, deduplicated by match ID (`team_games` table + `Mapy` "Game ID" column), linked to a `Mecze` row, and appended to `Mapy`. `drafts.py` rebuilds the `Drafty` tab from `Mapy`. Sheet columns are always found by row-4 header names.
+
 - **reminders.py** - Match reminders from the sheet's `Mecze` tab (`check_match_reminders` loop in bot.py): planned matches with the `Przypomnienie` checkbox ticked (columns located by row-4 header names) get pings 24h and 1h before (untimed ones at 18:00 the day before), deduplicated in the `match_reminders` table.
 
 ### Data Flow

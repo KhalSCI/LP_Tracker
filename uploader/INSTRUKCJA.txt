@@ -1,0 +1,25 @@
+﻿LP Tracker: wysyłanie scrimów z klienta LoL do arkusza drużyny
+
+JEDNORAZOWO
+1. Na Discordzie drużyny utwórz prywatny kanał (np. #scrimy-upload), widoczny tylko
+   dla Ciebie i bota LP Tracker.
+2. Edytuj kanał -> Integracje -> Webhooki -> Nowy webhook -> Kopiuj adres URL webhooka.
+3. Rozpakuj ten folder w stałym miejscu, np. Dokumenty\LP Tracker.
+4. Kliknij dwukrotnie "Wyslij scrimy.cmd" i wklej adres webhooka, gdy skrypt o niego
+   poprosi. Zapisze się w %APPDATA%\LP Tracker i nie trzeba go już podawać.
+   Jeśli Windows ostrzeże o pliku z internetu: prawy przycisk na pliku -> Właściwości ->
+   zaznacz "Odblokuj" -> OK (dla obu plików .cmd i pliku .ps1).
+
+PO SCRIMACH
+- Przy włączonym kliencie LoL kliknij dwukrotnie "Wyslij scrimy.cmd".
+- Albo uruchom "Wysylaj automatycznie.cmd": zminimalizowane okno sprawdza historię
+  co 5 minut i wysyła nowe gry samo. Wystarczy je zostawić włączone podczas scrimów.
+- Bot odpisze na kanale, ile map dodał i do których meczów. Jeśli scrima nie było
+  w zakładce Mecze, bot doda go sam: uzupełnij tam tylko nazwę przeciwnika.
+
+DOBRZE WIEDZIEĆ
+- Klient LoL pamięta ostatnie 20 gier, więc wysyłaj najpóźniej po kilku dniach.
+- Gry się nie dublują: skrypt pamięta, co wysłał, a bot i tak pomija gry, które ma.
+- Liczą się gry niestandardowe na Summoner's Rift, w których grało co najmniej
+  3 naszych graczy w jednej drużynie. Resztę bot pomija.
+- Skrypt tylko czyta historię meczów z Twojego klienta, nic nie zmienia w grze.

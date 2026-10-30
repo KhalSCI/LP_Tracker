@@ -16,6 +16,8 @@ from cogs.tracker import create_leaderboard_embed
 from cogs.notifications import create_match_notification_embed
 from cogs.sheet import sync_team_sheet
 from reminders import parse_planned_matches, due_reminders, create_reminder_message
+from team_games import sync_official_games
+from drafts import update_drafts_tab
 
 # notified_matches records older than this are deleted after each match check
 NOTIFIED_MATCH_RETENTION_DAYS = 7
@@ -42,6 +44,7 @@ class LPTrackerBot(commands.Bot):
         await self.load_extension("cogs.tracker")
         await self.load_extension("cogs.notifications")
         await self.load_extension("cogs.sheet")
+        await self.load_extension("cogs.scrims")
 
         # Sync slash commands
         await self.tree.sync()
@@ -256,6 +259,19 @@ class LPTrackerBot(commands.Bot):
             )
         except Exception as e:
             print(f"Error syncing team sheet: {e}")
+
+        try:
+            summary = await sync_official_games()
+            if summary["added"] or summary["unlinked"]:
+                print(f"Official games: {len(summary['added'])} maps added, {len(summary['unlinked'])} without a match")
+        except Exception as e:
+            print(f"Error adding official games: {e}")
+
+        try:
+            maps = await update_drafts_tab()
+            print(f"Updated drafts from {maps} maps")
+        except Exception as e:
+            print(f"Error updating drafts: {e}")
 
     @update_team_sheet.before_loop
     async def before_sheet_sync(self):

@@ -144,6 +144,17 @@ class RiotAPI:
             url += f"&start={start}"
         return await self._request(url)
 
+    async def get_tournament_match_ids(self, puuid: str, start_time: int, count: int = 100) -> list[str]:
+        """
+        Get a player's tournament-code games (e.g. official matches) since start_time
+        (Unix seconds). Regular custom games are not available in the Riot API.
+        """
+        url = (
+            f"{RIOT_ACCOUNT_API}/lol/match/v5/matches/by-puuid/{puuid}/ids"
+            f"?type=tourney&count={count}&startTime={start_time}"
+        )
+        return await self._request(url)
+
     async def get_match_details(self, match_id: str) -> dict:
         """
         Get detailed information about a specific match.

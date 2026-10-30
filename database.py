@@ -1,3 +1,5 @@
+import json
+
 import aiosqlite
 from datetime import datetime
 from pathlib import Path
@@ -104,6 +106,17 @@ async def init_db():
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_rank_history_puuid ON rank_history(puuid, recorded_at)"
         )
+        # Team games (scrims and officials) added to the sheet, one row per game
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS team_games (
+                match_id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                match_label TEXT,
+                start_ms INTEGER,
+                data TEXT NOT NULL,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         # Match reminders already posted, so each is sent once
         await db.execute("""
             CREATE TABLE IF NOT EXISTS match_reminders (
@@ -652,3 +665,31 @@ async def mark_reminder_sent(reminder_key: str) -> None:
             (reminder_key,)
         )
         await db.commit()
+
+
+async def get_team_game_ids() -> set[str]:
+    """Get the match IDs of all team games already added."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT match_id FROM team_games")
+        rows = await cursor.fetchall()
+        return {row[0] for row in rows}
+
+
+async def save_team_game(game: dict, match_label: str) -> bool:
+    """Store a team game (normalized, as JSON) unless it is already stored. Returns True if stored."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """INSERT OR IGNORE INTO team_games (match_id, source, match_label, start_ms, data)
+               VALUES (?, ?, ?, ?, ?)""",
+            (game["match_id"], game["source"], match_label, game["start_ms"], json.dumps(game))
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def get_team_games() -> list[dict]:
+    """Get all stored team games, each with its "match_label"."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT match_label, data FROM team_games ORDER BY start_ms")
+        rows = await cursor.fetchall()
+        return [dict(json.loads(data), match_label=label) for label, data in rows]

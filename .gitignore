@@ -20,3 +20,6 @@ env/
 # IDE
 .vscode/
 .idea/
+
+# Scrim uploads kept for troubleshooting
+uploads/
