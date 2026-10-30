@@ -31,12 +31,12 @@ AVAILABILITY_DAYS = int(os.getenv("AVAILABILITY_DAYS", 3))  # days ahead, from t
 
 # Comments on SoloQ games written by an LLM through OpenRouter (templates without a key)
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-6-luna")
 ROASTS_ENABLED = os.getenv("ROASTS_ENABLED", "1") not in ("0", "false", "False", "")
 ROASTS_PER_DAY = int(os.getenv("ROASTS_PER_DAY", 3))  # per player
 
-# Opponent scouting: ranked games read per player (current and previous season, newest first)
-SCOUT_MAX_GAMES = int(os.getenv("SCOUT_MAX_GAMES", 200))
+# Opponent scouting: ranked games read per player and season (current and previous, newest first)
+SCOUT_MAX_GAMES = int(os.getenv("SCOUT_MAX_GAMES", 100))
 
 # Riot API endpoints
 RIOT_ACCOUNT_API = "https://europe.api.riotgames.com"

@@ -15,6 +15,7 @@ A Discord bot that tracks League of Legends ranked LP across your friend group. 
 - **Slash commands** — Full Discord slash command interface with autocomplete
 - **Auto-updates** — Background tasks refresh leaderboards hourly and check for new matches every 5 minutes (configurable)
 - **Team Google Sheet sync** (optional) — Takes the roster from a Google Sheet and writes ranks, weekly activity, LP change, recent champions and games played together back to it; reminds about matches and missing availability, and keeps full data of scrims and officials
+- **Opponent scouting** — `/scout` (and automatically the day before an official) reports each opponent's champions this and last season with games and winrate, tournament games, suggested bans and pro-play priority from gol.gg
 - **SQLite storage** — Lightweight, no external database needed
 
 ## Requirements
@@ -91,6 +92,21 @@ The Riot API doesn't return regular custom games, so scrims come from the LoL cl
 - The `Drafty` tab is rebuilt every sync from `Mapy`: our champions per player (scrim/official record and SoloQ winrate), enemy champions we faced, bot lane and jungle-mid pairs, side winrate, and bans against us.
 - Full data of every team game is kept for later analysis (SoloQ games are not): the raw Riot API or LoL client JSON with its timeline goes to `team_game_raw` (gzipped), and `team_game_stats` gets one row per player of both teams: role, champion, KDA, kill participation, CS/min, gold and damage share, vision, wards, first blood, deaths before 14 minutes, and gold/CS/XP difference to the lane opponent at 10 and 15 minutes. Officials' timelines come from the Riot API; scrim timelines are sent by the uploader (format version 2). Roles missing in custom games are worked out from the timeline (jungle camps, lane positions). Games added before this are filled in from the saved uploads in `uploads/` during the sheet sync, and re-sending scrims (`Wyslij ponownie wszystko.cmd`) adds timelines to maps the bot already has.
 
+#### Opponent scouting
+
+`/scout <team> [players]` scouts an opponent for draft prep. Players are given as a multi op.gg link or Riot IDs separated by commas (EUW and EUNE accounts both work) and are remembered for the team; without them the bot uses the saved ones or the most frequent opponents from our games against that team (by the `Przeciwnik` column in `Mecze`). For each player the report shows:
+
+- rank (SoloQ and Flex) and main role,
+- champions in ranked this season and last season (up to `SCOUT_MAX_GAMES` newest games per season, default 100) with games, W/L, winrate and KDA,
+- champions in tournament-code and Clash games,
+- one-trick warnings,
+
+plus suggested bans (comfort picks by games and smoothed winrate, tournament games count triple), what the team picked and banned against us, pro-play priority and winrate of each champion from [gol.gg](https://gol.gg) (current season, all tournaments, cached for a day), and with an OpenRouter key a short summary. The embed goes to the channel and the full tables to the bot-only `Scouting` tab (overwritten by each scouting). Games are cached in `scout_games`, so the first scouting of a team can take 15–20 minutes because of the Riot API rate limit, and later ones only fetch new games. When the 24-hour (or day-before) reminder of an official (any type but Scrim) is posted and the opponent's players are known, the bot scouts it automatically and posts the report under the reminder.
+
+```env
+SCOUT_MAX_GAMES=100                 # ranked games per player and season
+```
+
 #### Comments on SoloQ games
 
 When a SoloQ game of a roster player is posted to the notification channel, the bot looks at it with the player's last 30 days of SoloQ and may reply with a short comment that pings the player: 3/5/7/10+ game win or lose streaks, the end of a 4+ streak, pentakills and great games, int games (10+ deaths, KDA under 1), losses on a champion outside the player's pool while a comfort pick has 60%+ winrate, and the third loss of the night. At most `ROASTS_PER_DAY` comments per player a day (default 3); players can turn them off with `/roast off`. Only players listed in `Skład` get comments.
@@ -99,7 +115,7 @@ The text comes from a cheap model through [OpenRouter](https://openrouter.ai), f
 
 ```env
 OPENROUTER_API_KEY=                 # empty = template comments
-OPENROUTER_MODEL=deepseek/deepseek-v4.1-flash
+OPENROUTER_MODEL=openai/gpt-6-luna
 ROASTS_ENABLED=1
 ROASTS_PER_DAY=3
 ```
@@ -155,6 +171,12 @@ sudo systemctl start lp-tracker
 | `/sheet sync` | Sync the team Google Sheet now |
 | `/sheet availability` | Show who would be pinged about missing availability (no pings) |
 
+### Scouting
+
+| Command | Description |
+|---|---|
+| `/scout <team> [players]` | Scout an opponent; `players` is a multi op.gg link or Riot IDs, saved for the team |
+
 ### Comments on games
 
 | Command | Description |
@@ -193,6 +215,7 @@ llm.py              — OpenRouter client for short texts
 members.py          — Discord members found by roster nick
 team_games.py       — Scrims (client uploads) and officials (Riot API) into Mecze/Mapy
 game_stats.py       — Full data of team games: raw JSON, timelines, per-player stats
+scouting.py         — Opponent scouting (Riot API pools, gol.gg pro meta, Scouting tab)
 drafts.py           — Drafty tab analysis
 champions.py        — Champion names from Data Dragon
 uploader/           — Windows script that sends scrims from the LoL client
@@ -202,6 +225,7 @@ cogs/
   sheet.py          — Team sheet sync (roster, match history, stats), /sheet sync and /sheet availability
   scrims.py         — Scrim uploads from the webhook
   roasts.py         — /roast on|off
+  scouting.py       — /scout
 ```
 
 ## API note

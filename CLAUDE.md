@@ -51,6 +51,8 @@ pip install -r requirements.txt
 
 - **game_stats.py** - Full data of team games only (never SoloQ): raw API/client JSON + timeline gzipped in `team_game_raw`, per-player stats of both teams in `team_game_stats` (GD/CSD/XPD@10/15 vs lane opponent, KP, shares, vision, early deaths). Roles missing in custom games are inferred from the timeline. Uploader format v2 sends client timelines; `backfill_game_data` fills older games from `uploads/` during the sheet sync.
 
+- **scouting.py** / **cogs/scouting.py** - `/scout <team> [players]`: opponents' Riot IDs (multi op.gg link or list, saved in `opponents`; else from our games vs that `Mecze` opponent) → ranked champions this and last season (season = 2010 + patch major, up to `SCOUT_MAX_GAMES` per season) and tournament games, cached in `scout_games`; ranks from the account's own platform (EUW/EUNE); pro priority/WR scraped from gol.gg's champion list (allowed by its robots.txt, cached a day); ban suggestions; optional LLM summary. Runs in the background behind one lock, posts an embed and rewrites the bot-only `Scouting` tab. Also started after the 24h/day reminder of a non-scrim match with known opponents.
+
 - **reminders.py** - Match reminders from the sheet's `Mecze` tab (`check_match_reminders` loop in bot.py): planned matches with the `Przypomnienie` checkbox ticked (columns located by row-4 header names) get pings 24h and 1h before (untimed ones at 18:00 the day before), deduplicated in the `match_reminders` table.
 
 ### Data Flow

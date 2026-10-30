@@ -17,7 +17,8 @@ from cogs.tracker import create_leaderboard_embed
 from cogs.notifications import create_match_notification_embed
 from cogs.sheet import sync_team_sheet, match_rows, SOLOQ_QUEUE, MATCH_HISTORY_DAYS, DAY_SECONDS
 from reminders import parse_planned_matches, due_reminders, create_reminder_message
-from team_games import sync_official_games
+from team_games import sync_official_games, SCRIM_TYPE
+import scouting
 from game_stats import backfill_game_data
 from drafts import update_drafts_tab
 from availability import AVAILABILITY_TAB, find_missing_availability, create_availability_message
@@ -30,6 +31,8 @@ NOTIFIED_MATCH_RETENTION_DAYS = 7
 # Only matches started within this window are checked. Must stay shorter than the
 # retention above, or a match whose record was cleaned up would be posted again.
 MATCH_LOOKBACK_SECONDS = 24 * 60 * 60
+# Reminders after which the opponent of an official is scouted (the day before the match)
+SCOUTING_REMINDERS = ("|24h", "|day")
 # The availability check runs once a day, from AVAILABILITY_HOUR; this is how often it looks at the clock
 AVAILABILITY_CHECK_INTERVAL = 30 * 60
 
@@ -54,6 +57,7 @@ class LPTrackerBot(commands.Bot):
         await self.load_extension("cogs.sheet")
         await self.load_extension("cogs.scrims")
         await self.load_extension("cogs.roasts")
+        await self.load_extension("cogs.scouting")
 
         # Sync slash commands
         await self.tree.sync()
@@ -374,8 +378,18 @@ class LPTrackerBot(commands.Bot):
                 await channel.send(content, embed=embed, allowed_mentions=allowed_mentions)
                 await db.mark_reminder_sent(key)
                 print(f"Sent match reminder: {key}")
+                if key.endswith(SCOUTING_REMINDERS) and match["opponent"] and match["type"] != SCRIM_TYPE:
+                    await self.scout_opponent(channel, match["opponent"])
         except Exception as e:
             print(f"Error checking match reminders: {e}")
+
+    async def scout_opponent(self, channel, opponent: str) -> None:
+        """Start scouting an official's opponent when its players are known (saved or from our games)."""
+        players = await scouting.known_players(opponent)
+        if players:
+            scouting.start_scouting(channel, opponent, players)
+        else:
+            print(f"Scouting: no players known for {opponent}, use /scout to add them")
 
     @check_match_reminders.before_loop
     async def before_reminder_check(self):

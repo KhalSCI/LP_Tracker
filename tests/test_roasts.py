@@ -50,7 +50,7 @@ class TestDetectTrigger:
     def test_five_wins(self):
         games = history(True, True, True, True, True, False)
         trigger = detect_trigger(stats_for(games[0]), games)
-        assert trigger == {"kind": "win_streak", "reason": "5 wygrane z rzędu"}
+        assert trigger == {"kind": "win_streak", "reason": "5 wygranych z rzędu"}
 
     def test_streak_end(self):
         games = history(True, False, False, False, False)
@@ -70,7 +70,7 @@ class TestDetectTrigger:
         games = history(False, True, champion="Aatrox") + comfort
         trigger = detect_trigger(stats_for(games[0]), games)
         assert trigger["kind"] == "off_pool"
-        assert "Camille ma 10 gier i 70% WR" in trigger["reason"]
+        assert "(Aatrox, wcześniej 1 gra), a Camille ma 10 gier i 70% WR" in trigger["reason"]
 
     def test_no_off_pool_without_a_comfort_pick(self):
         games = history(False, True, champion="Aatrox")
@@ -94,6 +94,14 @@ class TestDetectTrigger:
     def test_streak(self):
         assert streak(history(True, True, False)) == (True, 2)
         assert streak([]) == (False, 0)
+
+
+class TestPlural:
+    """Test cases for Polish plural forms."""
+
+    def test_forms(self):
+        assert [roasts.games_count(n) for n in (1, 2, 4, 5, 12, 22, 25)] == [
+            "1 gra", "2 gry", "4 gry", "5 gier", "12 gier", "22 gry", "25 gier"]
 
 
 class TestTexts:

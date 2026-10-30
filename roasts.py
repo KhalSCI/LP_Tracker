@@ -30,6 +30,19 @@ Opieraj się wyłącznie na podanych danych, nie wymyślaj statystyk ani zdarze�
 Lekkie przekleństwo może być, ale bez wyzwisk i bez żartów z wyglądu, pochodzenia, zdrowia czy orientacji. Nie zaczynaj od imienia ani pingu gracza (bot doda ping), najwyżej jedno emoji, bez cudzysłowu wokół całości."""
 
 
+def plural(n: int, one: str, few: str, many: str) -> str:
+    """Polish noun form for a count: 1 gra, 2 gry, 5 gier, 22 gry, 12 gier."""
+    if n == 1:
+        return f"{n} {one}"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return f"{n} {few}"
+    return f"{n} {many}"
+
+
+def games_count(n: int) -> str:
+    return plural(n, "gra", "gry", "gier")
+
+
 def is_soloq_game(game: dict) -> bool:
     return game["queue_id"] == SOLOQ_QUEUE and not game["remake"]
 
@@ -85,8 +98,8 @@ def detect_trigger(stats: dict, history: list[dict]) -> dict | None:
 
     if length in STREAK_MILESTONES:
         if won:
-            return {"kind": "win_streak", "reason": f"{length} wygrane z rzędu"}
-        return {"kind": "lose_streak", "reason": f"{length} porażki z rzędu" if length < 5 else f"{length} porażek z rzędu"}
+            return {"kind": "win_streak", "reason": f"{plural(length, 'wygrana', 'wygrane', 'wygranych')} z rzędu"}
+        return {"kind": "lose_streak", "reason": f"{plural(length, 'porażka', 'porażki', 'porażek')} z rzędu"}
 
     if stats.get("penta_kills"):
         return {"kind": "highlight", "reason": "pentakill"}
@@ -108,7 +121,7 @@ def detect_trigger(stats: dict, history: list[dict]) -> dict | None:
                 "kind": "off_pool",
                 "reason": (
                     f"przegrana na championie spoza puli ({champion_display_name(stats['champion_name'])}, "
-                    f"wcześniej {played_before} gier), a {comfort['champion']} ma {comfort['games']} gier "
+                    f"wcześniej {games_count(played_before)}), a {comfort['champion']} ma {games_count(comfort['games'])} "
                     f"i {round(comfort['wr'] * 100)}% WR"
                 ),
             }
@@ -116,7 +129,7 @@ def detect_trigger(stats: dict, history: list[dict]) -> dict | None:
     previous_won, previous_length = streak(history[1:])
     if previous_length >= STREAK_BREAK and previous_won != won:
         if won:
-            return {"kind": "streak_end", "reason": f"wreszcie wygrana po {previous_length} porażkach z rzędu"}
+            return {"kind": "streak_end", "reason": f"wreszcie wygrana po {plural(previous_length, 'porażce', 'porażkach', 'porażkach')} z rzędu"}
         return {"kind": "streak_end", "reason": f"koniec serii {previous_length} wygranych"}
 
     start = local_start(history[0])
@@ -167,7 +180,7 @@ def build_prompt(nick: str, player: dict, stats: dict, trigger: dict, history: l
         ),
         "Ostatnie gry (od najnowszej): " + ", ".join(format_game(g) for g in history[:HISTORY_FOR_PROMPT]),
         "Pula championów w SoloQ z 30 dni: " + ", ".join(
-            f"{c['champion']} {c['games']} gier {round(c['wr'] * 100)}% WR" for c in pool[:6]
+            f"{c['champion']} {games_count(c['games'])} {round(c['wr'] * 100)}% WR" for c in pool[:6]
         ),
     ]
     return "\n".join(lines)
