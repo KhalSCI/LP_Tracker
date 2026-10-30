@@ -49,6 +49,8 @@ IDS_PAGE = 100
 MONTH_SECONDS = 30 * 24 * 60 * 60
 # Besides the whole period, the report shows the most recent months on their own
 RECENT_MONTHS = 3
+# Periods offered by /scout as (SoloQ months, tournament months); "quick" is fast to fetch
+PERIODS = {"quick": (1, 12), "3": (3, 3), "6": (6, 6), "12": (12, 12)}
 # Rough time to fetch one game with the Riot API rate limit (100 requests per 2 minutes)
 SECONDS_PER_GAME = 1.3
 GOLGG_URL = "https://gol.gg/champion/list/season-S{season}/split-ALL/tournament-ALL/"
@@ -288,13 +290,16 @@ async def fetch_match_ids(puuid: str, start_time: int, match_type: str = None, q
             return ids
 
 
-async def new_match_ids(puuid: str, since: int, ranked_queues: set[int]) -> list[str]:
-    """An account's games in ranked_queues and tournament-code games since a Unix time that aren't stored yet."""
+async def new_match_ids(puuid: str, since: int, ranked_queues: set[int], tourney_since: int = None) -> list[str]:
+    """
+    An account's games in ranked_queues since a Unix time and tournament-code games since
+    tourney_since (default: the same time) that aren't stored yet.
+    """
     known = await db.get_scout_match_ids(puuid)
     ids = []
     for queue in sorted(ranked_queues):
         ids += await fetch_match_ids(puuid, since, queue=queue)
-    ids += await fetch_match_ids(puuid, since, match_type="tourney")
+    ids += await fetch_match_ids(puuid, tourney_since or since, match_type="tourney")
     return [match_id for match_id in dict.fromkeys(ids) if match_id not in known]
 
 
@@ -335,23 +340,34 @@ def champion_table(games: list[dict], pro_meta: dict) -> list[dict]:
     return sorted(table, key=lambda c: (-c["games"], -c["wins"], c["champion"]))
 
 
-def recent_months(months: int) -> int:
-    """The shorter period shown next to the whole one: 3 months, or 1 when the whole period is 3."""
-    return RECENT_MONTHS if months > RECENT_MONTHS else 1
+def recent_months(months: int) -> int | None:
+    """
+    The shorter SoloQ period shown next to the whole one: 3 months, 1 month for a 2-3 month
+    period, none for a single month.
+    """
+    if months > RECENT_MONTHS:
+        return RECENT_MONTHS
+    return 1 if months > 1 else None
 
 
-def summarize(games: list[dict], now: int, months: int, pro_meta: dict, policy: dict = EUW_POLICY) -> dict:
+def summarize(games: list[dict], now: int, months: int, pro_meta: dict, policy: dict = EUW_POLICY,
+              tourney_months: int = None) -> dict:
     """
     An account's champions in ranked (the queues its policy allows) over the last months and
-    the most recent ones, in tournament-code games, its main role and a one-trick warning.
-    now is Unix seconds.
+    the most recent ones, in tournament-code games over tourney_months (default: months),
+    its main role and a one-trick warning. now is Unix seconds.
     """
+    tourney_months = tourney_months or months
+    recent = recent_months(months)
     since_ms = (now - months * MONTH_SECONDS) * 1000
-    recent_since_ms = (now - recent_months(months) * MONTH_SECONDS) * 1000
-    counted = [g for g in games if g["win"] is not None and g["season"] and g["game_start"] >= since_ms]
-    ranked = [g for g in counted if g["queue_id"] in policy["queues"]]
-    recent = [g for g in ranked if g["game_start"] >= recent_since_ms]
-    tournament = [g for g in counted if g["queue_id"] not in RANKED_QUEUES and g["queue_id"] != CLASH_QUEUE]
+    tourney_since_ms = (now - tourney_months * MONTH_SECONDS) * 1000
+    counted = [g for g in games if g["win"] is not None and g["season"]]
+    ranked = [g for g in counted if g["queue_id"] in policy["queues"] and g["game_start"] >= since_ms]
+    recent_games = [g for g in ranked if recent and g["game_start"] >= (now - recent * MONTH_SECONDS) * 1000]
+    tournament = [
+        g for g in counted
+        if g["queue_id"] not in RANKED_QUEUES and g["queue_id"] != CLASH_QUEUE and g["game_start"] >= tourney_since_ms
+    ]
 
     roles = Counter(g["role"] for g in ranked + tournament if g["role"])
     role, role_games = roles.most_common(1)[0] if roles else ("", 0)
@@ -361,14 +377,15 @@ def summarize(games: list[dict], now: int, months: int, pro_meta: dict, policy: 
         one_trick = {"champion": ranked_table[0]["champion"], "share": ranked_table[0]["games"] / len(ranked)}
     return {
         "months": months,
-        "recent_months": recent_months(months),
+        "recent_months": recent,
+        "tourney_months": tourney_months,
         "ranked_label": policy["label"],
         "ranked_skipped": policy["skipped"],
         "ranked": ranked_table,
-        "recent": champion_table(recent, pro_meta),
+        "recent": champion_table(recent_games, pro_meta),
         "tournament": champion_table(tournament, pro_meta),
         "ranked_games": len(ranked),
-        "recent_games": len(recent),
+        "recent_games": len(recent_games),
         "tournament_games": len(tournament),
         "role": role,
         "role_share": role_games / sum(roles.values()) if roles else 0,
@@ -600,12 +617,13 @@ def summary_facts(report: dict) -> str:
         if s["ranked_skipped"]:
             ranked = f"{s['ranked_label']}: {s['ranked_skipped']}"
         else:
-            ranked = (f"{s['ranked_label']} w ostatnich {s['months']} mies.: {pool_text(s['ranked'], 5)}; "
-                      f"{s['ranked_label']} w ostatnich {s['recent_months']} mies.: {pool_text(s['recent'], 3)}")
+            ranked = f"{s['ranked_label']} w ostatnich {s['months']} mies.: {pool_text(s['ranked'], 5)}"
+            if s["recent_months"]:
+                ranked += f"; {s['ranked_label']} w ostatnich {s['recent_months']} mies.: {pool_text(s['recent'], 3)}"
         lines.append(
             f"{s['role'] or '?'} {player_name(player)} ({PLATFORM_NAMES.get(player['platform'], player['platform'])}, "
             f"{rank_text(player['ranks'].get('solo'))}): {ranked}; "
-            f"turnieje (kody turniejowe) w ostatnich {s['months']} mies.: {pool_text(s['tournament'], 5)}"
+            f"turnieje (kody turniejowe) w ostatnich {s['tourney_months']} mies.: {pool_text(s['tournament'], 5)}"
             + (f"; one-trick {s['one_trick']['champion']} ({pct(s['one_trick']['share'])} gier)" if s["one_trick"] else "")
         )
     if report["bans"]:
@@ -623,17 +641,21 @@ def summary_facts(report: dict) -> str:
     return "\n".join(lines)
 
 
-async def run_scouting(team_name: str, riot_ids: list[str], months: int = SCOUT_MONTHS, progress=None) -> dict:
+async def run_scouting(team_name: str, riot_ids: list[str], months: int = SCOUT_MONTHS, progress=None,
+                       tourney_months: int = None) -> dict:
     """
-    Collect the scouting report of a team from the last months of games (one scouting at a
-    time). Games are fetched only once, so the first scouting of a team takes a while;
-    progress (async, optional) gets the number of games to fetch before fetching starts.
+    Collect the scouting report of a team from SoloQ games of the last months and tournament
+    games of the last tourney_months (default: months), one scouting at a time. Games are
+    fetched only once, so the first scouting of a team takes a while; progress (async,
+    optional) gets the number of games to fetch before fetching starts.
     """
+    tourney_months = tourney_months or months
     async with _scout_lock:
         await champions.refresh()
         now = datetime.now(TIMEZONE)
         year = now.year
         since = int(now.timestamp()) - months * MONTH_SECONDS
+        tourney_since = int(now.timestamp()) - tourney_months * MONTH_SECONDS
         pro_meta = await fetch_pro_meta(year)
 
         players = [await lookup_account(riot_id) for riot_id in riot_ids]
@@ -648,14 +670,16 @@ async def run_scouting(team_name: str, riot_ids: list[str], months: int = SCOUT_
 
         to_fetch = {}
         for player in accounts:
-            to_fetch.update(dict.fromkeys(await new_match_ids(player["puuid"], since, player["policy"]["queues"])))
+            to_fetch.update(dict.fromkeys(
+                await new_match_ids(player["puuid"], since, player["policy"]["queues"], tourney_since)
+            ))
         if progress:
             await progress(len(to_fetch))
         await store_scout_games(list(to_fetch), {p["puuid"] for p in accounts})
 
         for player in accounts:
-            games = await db.get_scout_games(player["puuid"], since * 1000)
-            player["summary"] = summarize(games, int(now.timestamp()), months, pro_meta, player["policy"])
+            games = await db.get_scout_games(player["puuid"], min(since, tourney_since) * 1000)
+            player["summary"] = summarize(games, int(now.timestamp()), months, pro_meta, player["policy"], tourney_months)
 
         role_order = {role: i for i, role in enumerate(ROLES)}
         players.sort(key=lambda p: role_order.get((p.get("summary") or {}).get("role"), len(ROLES)))
@@ -663,6 +687,7 @@ async def run_scouting(team_name: str, riot_ids: list[str], months: int = SCOUT_
             "team": team_name,
             "year": year,
             "months": months,
+            "tourney_months": tourney_months,
             "created": datetime.now(TIMEZONE),
             "players": players,
             "fetched": len(to_fetch),
@@ -713,11 +738,10 @@ def embed_with(report: dict, count: int) -> discord.Embed:
         if s["ranked_skipped"]:
             lines.append(f"**{s['ranked_label']}:** {s['ranked_skipped']}")
         else:
-            lines += [
-                f"**{s['ranked_label']}, {s['months']} mies.:** {champion_line(s['ranked'], count)}",
-                f"**{s['ranked_label']}, {s['recent_months']} mies.:** {champion_line(s['recent'], count)}",
-            ]
-        lines.append(f"**Turnieje, {s['months']} mies.:** {champion_line(s['tournament'], count)}")
+            lines.append(f"**{s['ranked_label']}, {s['months']} mies.:** {champion_line(s['ranked'], count)}")
+            if s["recent_months"]:
+                lines.append(f"**{s['ranked_label']}, {s['recent_months']} mies.:** {champion_line(s['recent'], count)}")
+        lines.append(f"**Turnieje, {s['tourney_months']} mies.:** {champion_line(s['tournament'], count)}")
         if s["one_trick"]:
             lines.append(f"⚠ One-trick: {s['one_trick']['champion']} ({pct(s['one_trick']['share'])} gier w {s['months']} mies.)")
         embed.add_field(name=name[:256], value="\n".join(lines)[:1024], inline=False)
@@ -740,7 +764,8 @@ def embed_with(report: dict, count: int) -> discord.Embed:
             inline=False,
         )
     embed.set_footer(text=(
-        f"Ranked i gry turniejowe z {report['months']} mies. · pro: gol.gg S{year - SEASON_OFFSET}"
+        f"SoloQ z {report['months']} mies., gry turniejowe z {report['tourney_months']} mies. · "
+        f"pro: gol.gg S{year - SEASON_OFFSET}"
         + (" · pełne tabele w zakładce Scouting" if GOOGLE_SHEET_ID else "")
     ))
     return embed
@@ -766,8 +791,8 @@ def build_sheet_rows(report: dict) -> list[list]:
 
     add((0, [f"Scouting: {report['team']}"]))
     add((0, [
-        f"Wygenerowano {report['created']:%d.%m.%Y %H:%M} · gry z ostatnich {report['months']} mies.: SoloQ "
-        f"(konta spoza EUW tylko od Mastera) i osobno gry z kodów turniejowych · "
+        f"Wygenerowano {report['created']:%d.%m.%Y %H:%M} · SoloQ z ostatnich {report['months']} mies. "
+        f"(konta spoza EUW tylko od Mastera) i osobno gry z kodów turniejowych z ostatnich {report['tourney_months']} mies. · "
         f"pro: gol.gg S{year - SEASON_OFFSET}, wszystkie turnieje"
     ]))
     add()
@@ -808,14 +833,15 @@ def build_sheet_rows(report: dict) -> list[list]:
         else:
             ranked_titles = [
                 f"{s['ranked_label']}, ostatnie {s['months']} mies. ({games_count(s['ranked_games'])})",
-                f"{s['ranked_label']}, ostatnie {s['recent_months']} mies. ({games_count(s['recent_games'])})",
+                f"{s['ranked_label']}, ostatnie {s['recent_months']} mies. ({games_count(s['recent_games'])})"
+                if s["recent_months"] else "",
             ]
         titles = ranked_titles + [
-            f"Turnieje (kody turniejowe), ostatnie {s['months']} mies. ({games_count(s['tournament_games'])})",
+            f"Turnieje (kody turniejowe), ostatnie {s['tourney_months']} mies. ({games_count(s['tournament_games'])})",
         ]
-        add(*[(column, [title]) for column, title in zip(BLOCK_COLUMNS, titles)])
-        add(*[(column, BLOCK_HEADERS) for column in BLOCK_COLUMNS])
         blocks = [champion_block_rows(s["ranked"]), champion_block_rows(s["recent"]), champion_block_rows(s["tournament"])]
+        add(*[(column, [title]) for column, title in zip(BLOCK_COLUMNS, titles)])
+        add(*[(column, BLOCK_HEADERS) for column, block in zip(BLOCK_COLUMNS, blocks) if block])
         for i in range(max(len(block) for block in blocks)):
             add(*[(column, block[i]) for column, block in zip(BLOCK_COLUMNS, blocks) if i < len(block)])
 
@@ -841,7 +867,7 @@ def fetch_estimate(games: int) -> str:
 
 
 async def post_scouting(channel, team_name: str, riot_ids: list[str], months: int = SCOUT_MONTHS,
-                        announce_progress: bool = False) -> None:
+                        announce_progress: bool = False, tourney_months: int = None) -> None:
     """Run the scouting, write the Scouting tab and post the report to the channel."""
     async def progress(games: int) -> None:
         if games > 50:
@@ -850,7 +876,7 @@ async def post_scouting(channel, team_name: str, riot_ids: list[str], months: in
             )
 
     try:
-        report = await run_scouting(team_name, riot_ids, months, progress if announce_progress else None)
+        report = await run_scouting(team_name, riot_ids, months, progress if announce_progress else None, tourney_months)
     except Exception as e:
         print(f"Scouting of {team_name} failed: {e}")
         await channel.send(f"❌ Scouting drużyny **{discord.utils.escape_markdown(team_name)}** nie wyszedł: {e}")
@@ -867,9 +893,9 @@ async def post_scouting(channel, team_name: str, riot_ids: list[str], months: in
 
 
 def start_scouting(channel, team_name: str, riot_ids: list[str], months: int = SCOUT_MONTHS,
-                   announce_progress: bool = False) -> asyncio.Task:
+                   announce_progress: bool = False, tourney_months: int = None) -> asyncio.Task:
     """Scout in the background (it can take a while) and post the report when done."""
-    return asyncio.create_task(post_scouting(channel, team_name, riot_ids, months, announce_progress))
+    return asyncio.create_task(post_scouting(channel, team_name, riot_ids, months, announce_progress, tourney_months))
 
 
 def is_running() -> bool:

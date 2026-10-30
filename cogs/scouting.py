@@ -7,9 +7,10 @@ import scouting
 from config import SCOUT_MONTHS
 
 PERIODS = [
-    app_commands.Choice(name="3 miesiące", value=3),
-    app_commands.Choice(name="6 miesięcy", value=6),
-    app_commands.Choice(name="12 miesięcy", value=12),
+    app_commands.Choice(name="Szybki: SoloQ 1 miesiąc, turnieje 12 miesięcy", value="quick"),
+    app_commands.Choice(name="3 miesiące", value="3"),
+    app_commands.Choice(name="6 miesięcy", value="6"),
+    app_commands.Choice(name="12 miesięcy", value="12"),
 ]
 
 
@@ -31,15 +32,15 @@ class ScoutingCog(commands.Cog):
     @app_commands.describe(
         druzyna="Nazwa drużyny (jak w zakładce Przeciwnicy i w kolumnie Przeciwnik w Meczach)",
         gracze="Zamiast zakładki Przeciwnicy: linki multi op.gg (EUW i EUNE, oddzielone spacją) albo Riot ID po przecinku",
-        okres=f"Z jakiego okresu brać gry (domyślnie {SCOUT_MONTHS} miesięcy)",
+        okres=f"Z jakiego okresu brać gry (domyślnie {SCOUT_MONTHS} miesięcy); szybki: SoloQ z miesiąca, turnieje z roku",
     )
     @app_commands.autocomplete(druzyna=team_autocomplete)
     @app_commands.choices(okres=PERIODS)
     async def scout(self, interaction: discord.Interaction, druzyna: str, gracze: str = None,
-                    okres: app_commands.Choice[int] = None):
+                    okres: app_commands.Choice[str] = None):
         await interaction.response.defer()
         druzyna = druzyna.strip()
-        months = okres.value if okres else SCOUT_MONTHS
+        months, tourney_months = scouting.PERIODS[okres.value] if okres else (SCOUT_MONTHS, SCOUT_MONTHS)
 
         if gracze:
             players = scouting.parse_players(gracze)
@@ -59,11 +60,13 @@ class ScoutingCog(commands.Cog):
 
         queued = " Czekam w kolejce na poprzedni scouting." if scouting.is_running() else ""
         await interaction.followup.send(
-            f"🔎 Scouting **{discord.utils.escape_markdown(druzyna)}** z ostatnich {months} mies., "
+            f"🔎 Scouting **{discord.utils.escape_markdown(druzyna)}**: SoloQ z {months} mies., "
+            f"turnieje z {tourney_months} mies., "
             f"{len(players)} kont ({source}): {discord.utils.escape_markdown(', '.join(players))}.{queued} "
             "Gdy policzę gry do pobrania, napiszę, ile to potrwa; raport wrzucę tutaj."
         )
-        scouting.start_scouting(interaction.channel, druzyna, players, months, announce_progress=True)
+        scouting.start_scouting(interaction.channel, druzyna, players, months, announce_progress=True,
+                                tourney_months=tourney_months)
 
 
 async def setup(bot: commands.Bot):

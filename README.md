@@ -98,10 +98,12 @@ The Riot API doesn't return regular custom games, so scrims come from the LoL cl
 
 - SoloQ rank and main role,
 - champions in SoloQ over the period, 3, 6 or 12 months (default `SCOUT_MONTHS`, 6), and over its last 3 months (last month for a 3-month period), with games, W/L, winrate and KDA. Flex isn't scouted. SoloQ counts for EUW accounts; on other servers (EUNE) only for accounts that are Master or higher, since lower ones are often smurfs, and the report says it was skipped,
-- separately, champions in tournament-code games over the period, for every account (`type=tourney` in match-v5: only games of that account, and only when the organizer used Riot tournament codes; Clash isn't included),
+- separately, champions in tournament-code games over the period (12 months in the quick scouting), for every account (`type=tourney` in match-v5: only games of that account, and only when the organizer used Riot tournament codes; Clash isn't included),
 - one-trick warnings,
 
-plus suggested bans (comfort picks by games and smoothed winrate, tournament games count triple; SoloQ and tournament games and winrates are shown in separate columns), what the team picked and banned against us, pro-play priority and winrate of each champion from [gol.gg](https://gol.gg) (current season, all tournaments, cached for a day), and with an OpenRouter key a short summary. The embed goes to the channel and the full tables to the bot-only `Scouting` tab (overwritten by each scouting). There is no limit on the number of games: everything in the period is fetched, about 1.3 seconds per game because of the Riot API rate limit, so after counting the games the bot posts how long it will take (a 12-month first scouting of active players can take over an hour). Games are cached in `scout_games`, so later scoutings only fetch new games. When the 24-hour (or day-before) reminder of an official (any type but Scrim) is posted and the opponent's players are known, the bot scouts it automatically and posts the report under the reminder.
+The `period` option also offers a quick scouting: SoloQ of the last month and tournament-code games of the last 12 months, usually done in a few minutes.
+
+The report also has suggested bans (comfort picks by games and smoothed winrate, tournament games count triple; SoloQ and tournament games and winrates are shown in separate columns), what the team picked and banned against us, pro-play priority and winrate of each champion from [gol.gg](https://gol.gg) (current season, all tournaments, cached for a day), and with an OpenRouter key a short summary. The embed goes to the channel and the full tables to the bot-only `Scouting` tab (overwritten by each scouting). There is no limit on the number of games: everything in the period is fetched, about 1.3 seconds per game because of the Riot API rate limit, so after counting the games the bot posts how long it will take (a 12-month first scouting of active players can take over an hour). Games are cached in `scout_games`, so later scoutings only fetch new games. When the 24-hour (or day-before) reminder of an official (any type but Scrim) is posted and the opponent's players are known, the bot scouts it automatically and posts the report under the reminder.
 
 ```env
 SCOUT_MONTHS=6                      # default period in months (/scout offers 3, 6 and 12)
@@ -175,7 +177,7 @@ sudo systemctl start lp-tracker
 
 | Command | Description |
 |---|---|
-| `/scout <team> [players] [period]` | Scout an opponent from the `Przeciwnicy` tab (or `players`: multi op.gg links or Riot IDs) over 3, 6 or 12 months |
+| `/scout <team> [players] [period]` | Scout an opponent from the `Przeciwnicy` tab (or `players`: multi op.gg links or Riot IDs) over 3, 6 or 12 months, or quickly (SoloQ 1 month, tournaments 12 months) |
 
 ### Comments on games
 

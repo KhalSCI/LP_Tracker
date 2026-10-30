@@ -125,7 +125,17 @@ class TestSummarize:
         assert s["ranked_skipped"] == "nie liczę, konto EUNE poniżej Mastera"
 
     def test_recent_months(self):
-        assert [recent_months(m) for m in (3, 6, 12)] == [1, 3, 3]
+        assert [recent_months(m) for m in (1, 3, 6, 12)] == [None, 1, 3, 3]
+
+    def test_quick_period(self):
+        history = (games("Camille", 3, 1, days_ago=10) + games("Jax", 4, 0, days_ago=60)
+                   + games("Gnar", 2, 0, queue=3130, days_ago=300) + games("Azir", 1, 0, queue=3130, days_ago=400))
+        months, tourney_months = scouting.PERIODS["quick"]
+
+        s = summarize(history, NOW, months, {}, tourney_months=tourney_months)
+
+        assert [c["champion"] for c in s["ranked"]] == ["Camille"] and s["recent_months"] is None and s["recent"] == []
+        assert [c["champion"] for c in s["tournament"]] == ["Gnar"] and s["tourney_months"] == 12
 
     def test_one_trick(self):
         s = summarize(games("Camille", 10, 5) + games("Jax", 2, 2), NOW, 6, {})
@@ -155,7 +165,7 @@ class TestSheetRows:
     def test_layout(self):
         player = {"riot_id": "Top#EUW", "platform": "eun1", "ranks": {},
                   "summary": summarize(games("Camille", 8, 2) + games("Gnar", 1, 0, queue=3130), NOW, 6, {})}
-        report = {"team": "AGH", "year": YEAR, "months": 6, "created": datetime(2026, 10, 30, 16, 0, tzinfo=TIMEZONE),
+        report = {"team": "AGH", "year": YEAR, "months": 6, "tourney_months": 6, "created": datetime(2026, 10, 30, 16, 0, tzinfo=TIMEZONE),
                   "players": [player, {"riot_id": "X#1", "error": "Nie znaleziono konta"}],
                   "bans": ban_suggestions([player]), "summary": "• banujcie Camille", "pro_meta": {},
                   "history": empty_history()}
@@ -174,11 +184,28 @@ class TestSheetRows:
         assert rows[header + 1][18:20] == ["Gnar", 1]
         assert ["X#1", "⚠ Nie znaleziono konta"] == rows[-1][:2]
 
+    def test_quick_layout(self):
+        player = {"riot_id": "Top#EUW", "platform": "euw1", "ranks": {},
+                  "summary": summarize(games("Camille", 3, 1) + games("Gnar", 1, 0, queue=3130, days_ago=200), NOW, 1, {},
+                                       tourney_months=12)}
+        report = {"team": "AGH", "year": YEAR, "months": 1, "tourney_months": 12,
+                  "created": datetime(2026, 10, 30, 16, 0, tzinfo=TIMEZONE), "players": [player], "bans": [],
+                  "summary": None, "pro_meta": {}, "history": empty_history()}
+
+        titles = next(row for row in build_sheet_rows(report) if row[0].startswith("SoloQ, ostatnie"))
+        embed = scouting.build_embed(report)
+
+        assert [titles[0], titles[9], titles[18]] == [
+            "SoloQ, ostatnie 1 mies. (4 gry)", "", "Turnieje (kody turniejowe), ostatnie 12 mies. (1 gra)"]
+        assert "**SoloQ, 1 mies.:** Camille 4 (75%)" in embed.fields[0].value
+        assert "**Turnieje, 12 mies.:** Gnar 1 (100%)" in embed.fields[0].value
+        assert embed.footer.text.startswith("SoloQ z 1 mies., gry turniejowe z 12 mies.")
+
     def test_skipped_soloq(self):
         policy = ranked_policy("eun1", None)
         player = {"riot_id": "Smurf#EUNE", "platform": "eun1", "ranks": {},
                   "summary": summarize(games("Camille", 8, 2), NOW, 6, {}, policy)}
-        report = {"team": "AGH", "year": YEAR, "months": 6, "created": datetime(2026, 10, 30, 16, 0, tzinfo=TIMEZONE),
+        report = {"team": "AGH", "year": YEAR, "months": 6, "tourney_months": 6, "created": datetime(2026, 10, 30, 16, 0, tzinfo=TIMEZONE),
                   "players": [player], "bans": [], "summary": None, "pro_meta": {}, "history": empty_history()}
 
         titles = next(row for row in build_sheet_rows(report) if row[18].startswith("Turnieje"))
@@ -199,7 +226,7 @@ class TestEmbed:
         history += [g for c in champs for g in games(c, 1, 1, queue=3130)]
         players = [{"riot_id": f"Very Long Player Name {i}#EUNE", "platform": "eun1", "ranks": {},
                     "summary": summarize(history, NOW, 6, {})} for i in range(accounts)]
-        return {"team": "AGH", "year": YEAR, "months": 6, "created": datetime(2026, 10, 30, 16, 0, tzinfo=TIMEZONE),
+        return {"team": "AGH", "year": YEAR, "months": 6, "tourney_months": 6, "created": datetime(2026, 10, 30, 16, 0, tzinfo=TIMEZONE),
                 "players": players, "bans": ban_suggestions(players), "summary": summary, "pro_meta": {},
                 "history": empty_history()}
 
@@ -285,6 +312,13 @@ class TestFetching:
 
         assert len(await scouting.fetch_match_ids("a", NOW, queue=420)) == 250
         assert [call[3] for call in fake.id_calls] == [0, 100, 200]
+
+    async def test_quick_scouting_lists_tournaments_further_back(self, monkeypatch, fake):
+        await db.init_db()
+        await scouting.new_match_ids("b", NOW - MONTH_SECONDS, {420}, NOW - 12 * MONTH_SECONDS)
+
+        assert ("b", 420, NOW - MONTH_SECONDS, 0) in fake.id_calls
+        assert ("b", "tourney", NOW - 12 * MONTH_SECONDS, 0) in fake.id_calls
 
     async def test_run_reports_games_to_fetch(self, monkeypatch, fake):
         await db.init_db()
