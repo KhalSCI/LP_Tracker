@@ -816,13 +816,16 @@ def champion_line(table: list[dict], count: int) -> str:
     return ", ".join(f"{c['champion']} {c['games']} ({pct(c['wr'])})" for c in table[:count]) or "brak gier"
 
 
-def build_embed(report: dict) -> discord.Embed:
+def build_embed(report: dict, url: str = None) -> discord.Embed:
     """
-    Short version of the report for Discord (full tables go to the sheet), with fewer
-    champions per line when many accounts (e.g. EUW and EUNE ones) make it too long.
+    Short version of the report for Discord (full report on the web page at url, tables in
+    the sheet), with fewer champions per line when many accounts make it too long.
     """
     for count in EMBED_CHAMPIONS:
         embed = embed_with(report, count)
+        if url:
+            embed.url = url
+            embed.add_field(name="📄 Pełny raport", value=url, inline=False)
         if len(embed) <= EMBED_MAX_LENGTH:
             return embed
     if embed.description:
@@ -1070,7 +1073,15 @@ async def post_scouting(channel, team_name: str, riot_ids: list[str], months: in
         except Exception as e:
             print(f"Could not write the Scouting tab: {e}")
             note = "⚠ Nie udało się zapisać zakładki Scouting."
-    await channel.send(note or None, embed=build_embed(report))
+    url = None
+    try:
+        # Imported here: scouting_web renders with this module's helpers
+        from scouting_web import publish_report
+        url = publish_report(report)
+    except Exception as e:
+        print(f"Could not publish the scouting page: {e}")
+        note = (note + " " if note else "") + "⚠ Nie udało się opublikować strony z raportem."
+    await channel.send(note or None, embed=build_embed(report, url))
     print(f"Scouted {team_name}: {len(riot_ids)} players, {report['fetched']} games fetched")
 
 

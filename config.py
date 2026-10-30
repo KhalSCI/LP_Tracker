@@ -38,6 +38,10 @@ ROASTS_PER_DAY = int(os.getenv("ROASTS_PER_DAY", 3))  # per player
 # Opponent scouting: default period of ranked and tournament-code games, in months (/scout offers 3, 6, 12)
 SCOUT_MONTHS = int(os.getenv("SCOUT_MONTHS", 6))
 
+# Scouting reports as HTML pages: folder a web server serves and its public URL (both empty = off)
+SCOUTING_WEB_DIR = os.getenv("SCOUTING_WEB_DIR", "")
+SCOUTING_WEB_URL = os.getenv("SCOUTING_WEB_URL", "").rstrip("/")
+
 # Riot API endpoints
 RIOT_ACCOUNT_API = "https://europe.api.riotgames.com"
 RIOT_EUW_API = "https://euw1.api.riotgames.com"

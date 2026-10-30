@@ -12,6 +12,8 @@ class ChampionData:
     def __init__(self):
         self.by_key: dict[int, str] = {}  # 62 -> "Wukong"
         self.by_id: dict[str, str] = {}  # "MonkeyKing" -> "Wukong"
+        self.id_by_name: dict[str, str] = {}  # "Wukong" -> "MonkeyKing"
+        self.version = ""
         self._loaded_at = 0.0
 
     async def refresh(self) -> None:
@@ -30,6 +32,8 @@ class ChampionData:
             return
         self.by_key = {int(champion["key"]): champion["name"] for champion in data.values()}
         self.by_id = {champion["id"]: champion["name"] for champion in data.values()}
+        self.id_by_name = {champion["name"]: champion["id"] for champion in data.values()}
+        self.version = version
         self._loaded_at = time.time()
 
     def name(self, champion_id: int = None, champion_key: str = None) -> str:
@@ -39,6 +43,13 @@ class ChampionData:
         if champion_key:
             return self.by_id.get(champion_key, champion_key)
         return f"Champion {champion_id}"
+
+    def icon_url(self, name: str) -> str | None:
+        """Data Dragon square icon of a champion by display name (or key), None if unknown."""
+        champion_id = self.id_by_name.get(name) or (name if name in self.by_id else None)
+        if not champion_id or not self.version:
+            return None
+        return f"{DDRAGON}/cdn/{self.version}/img/champion/{champion_id}.png"
 
     @property
     def names(self) -> list[str]:

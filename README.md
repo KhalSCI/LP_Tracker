@@ -110,6 +110,21 @@ The report also has suggested bans (comfort picks by games and smoothed winrate,
 SCOUT_MONTHS=6                      # default period in months (/scout offers 3, 6 and 12)
 ```
 
+Each report is also published as an HTML page (dark, mobile-friendly: ban cards and player cards with champion icons, SoloQ and tournament columns, pro meta), linked from the embed's title and a "Pełny raport" field. The bot writes the page, a page per team that always shows its latest scouting, and an index of all reports into `SCOUTING_WEB_DIR`; a web server serves that folder at `SCOUTING_WEB_URL`. Both empty turns it off. Use an unguessable folder name: the pages carry `noindex`, and there is no listing above that folder. For nginx:
+
+```nginx
+location ^~ /scouting/ {
+    alias /home/khal/sites/scouting/;
+    index index.html;
+    add_header X-Robots-Tag "noindex, nofollow" always;
+}
+```
+
+```env
+SCOUTING_WEB_DIR=/home/khal/sites/scouting/<random folder>
+SCOUTING_WEB_URL=https://khal-dev.com/scouting/<random folder>
+```
+
 #### Comments on SoloQ games
 
 When a SoloQ game of a roster player is posted to the notification channel, the bot looks at it with the player's last 30 days of SoloQ and may reply with a short comment that pings the player: 3/5/7/10+ game win or lose streaks, the end of a 4+ streak, pentakills and great games, int games (10+ deaths, KDA under 1), losses on a champion outside the player's pool while a comfort pick has 60%+ winrate, and the third loss of the night. At most `ROASTS_PER_DAY` comments per player a day (default 3); players can turn them off with `/roast off`. Only players listed in `Skład` get comments.
@@ -220,6 +235,8 @@ team_games.py       — Scrims (client uploads) and officials (Riot API) into Me
 game_stats.py       — Full data of team games: raw JSON, timelines, per-player stats
 stats_tab.py        — Statystyki tab from those stats
 scouting.py         — Opponent scouting (Riot API pools, gol.gg pro meta, Scouting tab)
+scouting_web.py     — Scouting reports as HTML pages and their index
+sheet_format.py     — Formatting requests shared by the bot-written tabs
 drafts.py           — Drafty tab analysis
 champions.py        — Champion names from Data Dragon
 uploader/           — Windows script that sends scrims from the LoL client
