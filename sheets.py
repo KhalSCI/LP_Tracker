@@ -139,6 +139,23 @@ class TeamSheet:
         """
         await asyncio.to_thread(self._write, tab, updates, rows, cols)
 
+    def _create_tab(self, tab: str, updates: list[dict], rows: int, cols: int, frozen_rows: int) -> bool:
+        with self._lock:
+            spreadsheet = self._open()
+            try:
+                spreadsheet.worksheet(tab)
+                return False
+            except gspread.WorksheetNotFound:
+                worksheet = spreadsheet.add_worksheet(tab, rows=rows, cols=cols)
+            worksheet.batch_update(updates, value_input_option="RAW")
+            if frozen_rows:
+                worksheet.freeze(rows=frozen_rows)
+            return True
+
+    async def create_tab(self, tab: str, updates: list[dict], rows: int, cols: int, frozen_rows: int = 0) -> bool:
+        """Add a tab with initial values (e.g. headers) unless it exists. Returns True if it was added."""
+        return await asyncio.to_thread(self._create_tab, tab, updates, rows, cols, frozen_rows)
+
     def _replace_tab(self, tab: str, updates: list[dict], rows: int, cols: int) -> None:
         with self._lock:
             spreadsheet = self._open()

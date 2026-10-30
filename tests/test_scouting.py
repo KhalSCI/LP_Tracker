@@ -4,6 +4,7 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import gspread
 import pytest
 
 import bot as bot_module
@@ -12,11 +13,13 @@ import scouting
 from champions import champions
 from config import TIMEZONE
 from scouting import (
-    parse_players, season_of, parse_pro_meta, champion_key, summarize, ban_suggestions,
-    build_sheet_rows, scout_rows, SHEET_COLS,
+    parse_players, season_of, parse_pro_meta, champion_key, summarize, ban_suggestions, recent_months,
+    build_sheet_rows, scout_rows, parse_opponent_rows, SHEET_COLS, MONTH_SECONDS,
 )
 
 YEAR = 2026
+NOW = int(datetime(2026, 10, 30, 18, 0, tzinfo=TIMEZONE).timestamp())
+DAY = 24 * 60 * 60
 GOLGG_HTML = """
 <table class="region_filter"><tr><td>Season:</td></tr></table>
 <table class='table_list playerslist tablesaw trhover'>
@@ -29,10 +32,10 @@ GOLGG_HTML = """
 """
 
 
-def game(champion: str, win=True, season=YEAR, queue=420, role="Top", kills=5, deaths=2, assists=5, puuid="p1", n=0) -> dict:
-    return {"puuid": puuid, "match_id": f"EUW1_{champion}_{season}_{queue}_{n}", "queue_id": queue,
-            "game_start": int(datetime(season or YEAR, 6, 1, tzinfo=TIMEZONE).timestamp() * 1000), "season": season,
-            "champion": champion, "role": role, "win": win, "kills": kills, "deaths": deaths, "assists": assists}
+def game(champion: str, win=True, days_ago=10, queue=420, role="Top", season=YEAR, puuid="p1", n=0) -> dict:
+    return {"puuid": puuid, "match_id": f"EUW1_{champion}_{days_ago}_{queue}_{n}", "queue_id": queue,
+            "game_start": (NOW - days_ago * DAY) * 1000, "season": season, "champion": champion, "role": role,
+            "win": win, "kills": 5, "deaths": 2, "assists": 5}
 
 
 def games(champion: str, wins: int, losses: int, **kwargs) -> list[dict]:
@@ -82,38 +85,48 @@ class TestProMeta:
 class TestSummarize:
     """Test cases for summarize and ban_suggestions."""
 
-    def test_seasons_and_tournaments(self):
-        history = (games("Camille", 8, 2) + games("Jax", 1, 3)
-                   + games("Aatrox", 3, 3, season=YEAR - 1)
-                   + games("Gnar", 2, 0, queue=3130)
-                   + games("Orianna", 3, 0, queue=700)
-                   + games("Fiora", 5, 0, season=YEAR - 2))
+    def test_period_and_recent_months(self):
+        history = (games("Camille", 6, 1, days_ago=20) + games("Jax", 1, 2, days_ago=120)
+                   + games("Aatrox", 3, 3, days_ago=200)
+                   + games("Gnar", 2, 0, queue=3130, days_ago=50)
+                   + games("Orianna", 3, 0, queue=700))  # Clash isn't scouted
         history.append(game("Camille", win=None, n=999))  # remake
         history.append(game("Teemo", season=None, n=998))  # not on Summoner's Rift
 
-        s = summarize(history, YEAR, {"camille": {"prio": 0.2, "wr": 0.5}})
+        s = summarize(history, NOW, 6, {"camille": {"prio": 0.2, "wr": 0.5}})
 
-        assert [(c["champion"], c["games"], c["wins"]) for c in s["current"]] == [("Camille", 10, 8), ("Jax", 4, 1)]
-        assert s["current"][0]["pro_prio"] == 0.2 and s["current"][0]["kda"] == 5.0
-        assert [c["champion"] for c in s["previous"]] == ["Aatrox"]
+        assert [(c["champion"], c["games"], c["wins"]) for c in s["ranked"]] == [("Camille", 7, 6), ("Jax", 3, 1)]
+        assert [c["champion"] for c in s["recent"]] == ["Camille"]
         assert [c["champion"] for c in s["tournament"]] == ["Gnar"]
-        assert s["current_games"] == 14 and s["role"] == "Top"
-        assert s["one_trick"] is None
+        assert s["ranked"][0]["pro_prio"] == 0.2 and s["ranked"][0]["kda"] == 5.0
+        assert (s["months"], s["recent_months"], s["ranked_games"], s["recent_games"]) == (6, 3, 10, 7)
+        assert s["role"] == "Top" and s["one_trick"] is None
+
+        longer = summarize(history, NOW, 12, {})
+        assert [c["champion"] for c in longer["ranked"]] == ["Camille", "Aatrox", "Jax"]
+
+    def test_recent_months(self):
+        assert [recent_months(m) for m in (3, 6, 12)] == [1, 3, 3]
 
     def test_one_trick(self):
-        s = summarize(games("Camille", 10, 5) + games("Jax", 2, 2), YEAR, {})
+        s = summarize(games("Camille", 10, 5) + games("Jax", 2, 2), NOW, 6, {})
         assert s["one_trick"]["champion"] == "Camille"
 
     def test_ban_suggestions(self):
-        top = {"riot_id": "Top#EUW", "summary": summarize(games("Camille", 8, 2) + games("Jax", 1, 3), YEAR, {})}
-        mid = {"riot_id": "Mid#EUW", "summary": summarize(games("Ahri", 5, 5, role="Mid") + games("Azir", 2, 1, queue=0, role="Mid"), YEAR, {})}
+        top = {"riot_id": "Top#EUW", "summary": summarize(games("Camille", 8, 2) + games("Jax", 1, 3), NOW, 6, {})}
+        mid = {"riot_id": "Mid#EUW", "summary": summarize(
+            games("Ahri", 5, 5, role="Mid") + games("Azir", 2, 1, queue=3130, role="Mid"), NOW, 6, {})}
         error = {"riot_id": "X#1", "error": "Nie znaleziono konta"}
 
         bans = ban_suggestions([top, mid, error])
 
         assert [b["champion"] for b in bans] == ["Camille", "Azir", "Ahri"]
-        assert bans[0]["reason"] == "10 gier, 80% WR w tym sezonie" and bans[0]["player"] == "Top"
+        assert bans[0]["reason"] == "10 gier, 80% WR w 6 mies." and bans[0]["player"] == "Top"
         assert bans[1]["reason"] == "3 w turniejach (67% WR)"
+
+
+def empty_history() -> dict:
+    return {"games": 0, "wins": 0, "players": Counter(), "picks": Counter(), "bans": Counter()}
 
 
 class TestSheetRows:
@@ -121,17 +134,20 @@ class TestSheetRows:
 
     def test_layout(self):
         player = {"riot_id": "Top#EUW", "platform": "eun1", "ranks": {},
-                  "summary": summarize(games("Camille", 8, 2) + games("Gnar", 1, 0, queue=0), YEAR, {})}
-        report = {"team": "AGH", "year": YEAR, "created": datetime(2026, 10, 30, 16, 0, tzinfo=TIMEZONE),
+                  "summary": summarize(games("Camille", 8, 2) + games("Gnar", 1, 0, queue=3130), NOW, 6, {})}
+        report = {"team": "AGH", "year": YEAR, "months": 6, "created": datetime(2026, 10, 30, 16, 0, tzinfo=TIMEZONE),
                   "players": [player, {"riot_id": "X#1", "error": "Nie znaleziono konta"}],
                   "bans": ban_suggestions([player]), "summary": "• banujcie Camille", "pro_meta": {},
-                  "history": {"games": 0, "wins": 0, "players": Counter(), "picks": Counter(), "bans": Counter()}}
+                  "history": empty_history()}
 
         rows = build_sheet_rows(report)
 
         assert all(len(row) == SHEET_COLS for row in rows)
-        assert rows[0][0] == "Scouting: AGH"
-        assert ["Camille", "Top", "Top", "10 gier, 80% WR w tym sezonie", "", ""] == rows[5][:6]
+        assert rows[0][0] == "Scouting: AGH" and "z ostatnich 6 mies." in rows[1][0]
+        assert ["Camille", "Top", "Top", "10 gier, 80% WR w 6 mies.", "", ""] == rows[5][:6]
+        titles = next(row for row in rows if row[0].startswith("Ranked, ostatnie"))
+        assert [titles[0], titles[9], titles[18]] == [
+            "Ranked, ostatnie 6 mies. (10 gier)", "Ranked, ostatnie 3 mies. (10 gier)", "Turnieje, ostatnie 6 mies. (1 gra)"]
         header = next(i for i, row in enumerate(rows) if row[0] == "Champion" and row[9] == "Champion")
         assert rows[header + 1][:6] == ["Camille", 10, 8, 2, "80%", 5.0]
         assert rows[header + 1][18:20] == ["Gnar", 1]
@@ -144,17 +160,18 @@ class TestEmbed:
     def report(self, accounts: int, summary: str = None) -> dict:
         champs = ["Camille", "Jax", "Aatrox", "Gnar", "Fiora", "Renekton", "Ksante", "Rumble"]
         history = [g for i, c in enumerate(champs) for g in games(c, 5 + i, 3)]
-        history += [g for c in champs for g in games(c, 2, 2, season=YEAR - 1)]
+        history += [g for c in champs for g in games(c, 2, 2, days_ago=150)]
         history += [g for c in champs for g in games(c, 1, 1, queue=3130)]
         players = [{"riot_id": f"Very Long Player Name {i}#EUNE", "platform": "eun1", "ranks": {},
-                    "summary": summarize(history, YEAR, {})} for i in range(accounts)]
-        return {"team": "AGH", "year": YEAR, "created": datetime(2026, 10, 30, 16, 0, tzinfo=TIMEZONE),
+                    "summary": summarize(history, NOW, 6, {})} for i in range(accounts)]
+        return {"team": "AGH", "year": YEAR, "months": 6, "created": datetime(2026, 10, 30, 16, 0, tzinfo=TIMEZONE),
                 "players": players, "bans": ban_suggestions(players), "summary": summary, "pro_meta": {},
-                "history": {"games": 0, "wins": 0, "players": Counter(), "picks": Counter(), "bans": Counter()}}
+                "history": empty_history()}
 
     def test_five_accounts_get_four_champions(self):
         embed = scouting.build_embed(self.report(5))
         assert embed.fields[0].value.count("(") == 4 * 3
+        assert "**6 mies.:**" in embed.fields[0].value and "**3 mies.:**" in embed.fields[0].value
 
     def test_ten_accounts_fit(self):
         embed = scouting.build_embed(self.report(10, summary="• " + "banujcie Camille " * 200))
@@ -163,22 +180,23 @@ class TestEmbed:
 
 
 class FakeRiot:
-    """Match IDs per (puuid, type, window) and match payloads."""
+    """Match IDs per (puuid, type) honoring paging, and match payloads."""
 
     def __init__(self, matches: dict[str, dict], ids: dict[tuple, list[str]]):
-        self.matches, self.ids, self.details_calls = matches, ids, []
+        self.matches, self.ids, self.details_calls, self.id_calls = matches, ids, [], []
 
-    async def get_match_ids(self, puuid, match_type=None, start_time=None, end_time=None, start=0, count=100):
-        return self.ids.get((puuid, match_type, end_time is None), [])[start:start + count]
+    async def get_match_ids(self, puuid, match_type=None, start_time=None, start=0, count=100):
+        self.id_calls.append((puuid, match_type, start_time, start))
+        return self.ids.get((puuid, match_type), [])[start:start + count]
 
     async def get_match_details(self, match_id):
         self.details_calls.append(match_id)
         return self.matches[match_id]
 
 
-def payload(match_id: str, players: dict[str, str], version="16.21.1.1", queue=420) -> dict:
+def payload(match_id: str, players: dict[str, str], queue=420) -> dict:
     return {"metadata": {"matchId": match_id}, "info": {
-        "mapId": 11, "queueId": queue, "gameVersion": version, "gameStartTimestamp": 1_790_000_000_000,
+        "mapId": 11, "queueId": queue, "gameVersion": "16.21.1.1", "gameStartTimestamp": (NOW - 10 * DAY) * 1000,
         "participants": [{"puuid": puuid, "championId": 0, "championName": champ, "teamPosition": "TOP",
                           "win": True, "kills": 1, "deaths": 1, "assists": 1} for puuid, champ in players.items()]}}
 
@@ -189,51 +207,127 @@ def setup(monkeypatch, tmp_path):
     monkeypatch.setattr(champions, "by_key", {})
     monkeypatch.setattr(champions, "by_id", {})
     monkeypatch.setattr(champions, "refresh", AsyncMock())
+    monkeypatch.setattr(scouting, "_opponents_cache", None)
 
 
-class TestSync:
-    """Test cases for fetching and storing scouted games."""
+class TestFetching:
+    """Test cases for listing, fetching and storing scouted games."""
 
-    async def test_shared_games_fetched_once(self, monkeypatch):
-        await db.init_db()
+    @pytest.fixture
+    def fake(self, monkeypatch):
         matches = {
             "EUW1_1": payload("EUW1_1", {"a": "Camille", "b": "Ahri"}),
-            "EUW1_2": payload("EUW1_2", {"a": "Jax"}, version="15.20.1.1"),
+            "EUW1_2": payload("EUW1_2", {"a": "Jax"}),
             "EUW1_3": payload("EUW1_3", {"b": "Azir"}, queue=3130),
         }
-        fake = FakeRiot(matches, {("a", "ranked", True): ["EUW1_1"], ("a", "ranked", False): ["EUW1_2"],
-                                  ("b", "ranked", True): ["EUW1_1"], ("b", "tourney", True): ["EUW1_3"]})
+        fake = FakeRiot(matches, {("a", "ranked"): ["EUW1_1", "EUW1_2"], ("b", "ranked"): ["EUW1_1"],
+                                  ("b", "tourney"): ["EUW1_3"]})
         monkeypatch.setattr(scouting.riot_api, "get_match_ids", fake.get_match_ids)
         monkeypatch.setattr(scouting.riot_api, "get_match_details", fake.get_match_details)
+        return fake
 
-        assert await scouting.sync_scout_games("a", {"a", "b"}, YEAR) == 2
-        assert await scouting.sync_scout_games("b", {"a", "b"}, YEAR) == 1
-        assert await scouting.sync_scout_games("a", {"a", "b"}, YEAR) == 0
+    async def test_new_ids_and_shared_games(self, fake):
+        await db.init_db()
+        since = NOW - 6 * MONTH_SECONDS
+
+        assert await scouting.new_match_ids("a", since) == ["EUW1_1", "EUW1_2"]
+        await scouting.store_scout_games(["EUW1_1", "EUW1_2"], {"a", "b"})
+        assert await scouting.new_match_ids("b", since) == ["EUW1_3"]
+        await scouting.store_scout_games(["EUW1_3"], {"a", "b"})
+        assert await scouting.new_match_ids("a", since) == []
 
         assert fake.details_calls == ["EUW1_1", "EUW1_2", "EUW1_3"]
+        assert ("a", "ranked", since, 0) in fake.id_calls
         b_games = await db.get_scout_games("b")
-        assert {(g["champion"], g["season"], g["queue_id"]) for g in b_games} == {("Ahri", 2026, 420), ("Azir", 2026, 3130)}
+        assert {(g["champion"], g["queue_id"]) for g in b_games} == {("Ahri", 420), ("Azir", 3130)}
+
+    async def test_paging_has_no_game_limit(self, monkeypatch):
+        fake = FakeRiot({}, {("a", "ranked"): [f"EUW1_{i}" for i in range(250)]})
+        monkeypatch.setattr(scouting.riot_api, "get_match_ids", fake.get_match_ids)
+
+        assert len(await scouting.fetch_match_ids("a", "ranked", NOW)) == 250
+        assert [call[3] for call in fake.id_calls] == [0, 100, 200]
+
+    async def test_run_reports_games_to_fetch(self, monkeypatch, fake):
+        await db.init_db()
+        monkeypatch.setattr(scouting, "lookup_account", AsyncMock(side_effect=lambda r: {
+            "riot_id": r, "puuid": r.split("#")[0], "platform": "euw1"}))
+        monkeypatch.setattr(scouting.riot_api, "get_league_entries", AsyncMock(return_value=[]))
+        monkeypatch.setattr(scouting, "fetch_pro_meta", AsyncMock(return_value={}))
+        monkeypatch.setattr(scouting, "GOOGLE_SHEET_ID", "")
+        monkeypatch.setattr(scouting.llm, "enabled", lambda: False)
+        progress = AsyncMock()
+
+        report = await scouting.run_scouting("AGH", ["a#1", "b#1"], 6, progress)
+
+        progress.assert_awaited_once_with(3)
+        assert report["fetched"] == 3 and report["months"] == 6
+        assert [c["champion"] for c in report["players"][1]["summary"]["tournament"]] == ["Azir"]
 
     def test_remake_row(self):
         data = payload("EUW1_9", {"a": "Camille"})
         data["info"]["participants"][0]["gameEndedInEarlySurrender"] = True
         assert scout_rows("EUW1_9", data, {"a"})[0]["win"] is None
 
+    def test_estimate(self):
+        assert scouting.fetch_estimate(10) == "około 1 min"
+        assert scouting.fetch_estimate(600) == "około 13 min"
+
+
+OPPONENTS_ROWS = [
+    ["Drużyna", "Multi EUW", "Multi EUNE", "Notatki"],
+    ["Cockpit", "https://op.gg/lol/multisearch/euw?summoners=A%23EUW%2CB%23EUW",
+     "https://op.gg/lol/multisearch/eune?summoners=C%23EUNE", ""],
+    ["Francja", "", "", "jeszcze nie wiemy"],
+    ["AGH", "D#EUW, E#EUW", "", ""],
+]
+
 
 class TestKnownPlayers:
     """Test cases for finding an opponent's players."""
 
-    async def test_saved_players_first(self):
+    def test_parse_opponent_rows(self):
+        teams = parse_opponent_rows(OPPONENTS_ROWS)
+        assert teams == {"cockpit": {"name": "Cockpit", "players": ["A#EUW", "B#EUW", "C#EUNE"]},
+                         "agh": {"name": "AGH", "players": ["D#EUW", "E#EUW"]}}
+
+    @pytest.fixture
+    def sheet(self, monkeypatch):
+        monkeypatch.setattr(scouting, "GOOGLE_SHEET_ID", "sheet")
+        sheet = SimpleNamespace(read_tab=AsyncMock(return_value=OPPONENTS_ROWS), read_matches=AsyncMock(return_value=[]),
+                                create_tab=AsyncMock(return_value=True))
+        monkeypatch.setattr(scouting, "team_sheet", sheet)
+        return sheet
+
+    async def test_sheet_first(self, sheet):
+        await db.init_db()
+        await db.save_opponent("Cockpit", ["Old#1"])
+        assert await scouting.known_players(" cockpit ") == (["A#EUW", "B#EUW", "C#EUNE"], "zakładka Przeciwnicy")
+
+    async def test_saved_players_when_not_in_sheet(self, sheet):
         await db.init_db()
         await db.save_opponent("AGH Esports", ["A#1", "B#2"])
-        assert await scouting.known_players("agh esports") == ["A#1", "B#2"]
+        assert await scouting.known_players("agh esports") == (["A#1", "B#2"], "zapisane z /scout")
+        assert set(await scouting.team_names()) == {"Cockpit", "AGH", "AGH Esports"}
 
-    async def test_from_our_games_against_them(self, monkeypatch):
+    async def test_missing_tab_is_added_with_opponents_from_mecze(self, sheet):
         await db.init_db()
-        header = ["Data", "Godz.", "Typ", "Przeciwnik", "Mecz (do Map)"]
-        monkeypatch.setattr(scouting, "GOOGLE_SHEET_ID", "sheet")
-        monkeypatch.setattr(scouting.team_sheet, "read_matches", AsyncMock(return_value=[
-            header, [1, 0.5, "Liga", "AGH", "01.10 18:00 · Liga"], [2, 0.5, "Scrim", "PWr", "02.10 18:00 · Scrim"]]))
+        sheet.read_tab.side_effect = gspread.WorksheetNotFound("Przeciwnicy")
+        sheet.read_matches.return_value = [["Data", "Przeciwnik"], [1, "Cockpit"], [2, "francja"], [3, "Cockpit"], [4, ""]]
+
+        assert await scouting.known_players("Cockpit") == ([], "")
+
+        tab, updates, *_ = sheet.create_tab.await_args.args
+        assert tab == "Przeciwnicy"
+        assert {"range": "A4:D4", "values": [["Drużyna", "Multi EUW", "Multi EUNE", "Notatki"]]} in updates
+        assert {"range": "A5:A6", "values": [["Cockpit"], ["francja"]]} in updates
+
+    async def test_from_our_games_against_them(self, monkeypatch, sheet):
+        await db.init_db()
+        sheet.read_tab.return_value = [OPPONENTS_ROWS[0]]
+        sheet.read_matches.return_value = [
+            ["Data", "Godz.", "Typ", "Przeciwnik", "Mecz (do Map)"],
+            [1, 0.5, "Liga", "Cockpit", "01.10 18:00 · Liga"], [2, 0.5, "Scrim", "PWr", "02.10 18:00 · Scrim"]]
         for match_id, label, enemies in (("EUW1_1", "01.10 18:00 · Liga", ["E1#X", "E2#X"]),
                                          ("EUW1_2", "01.10 18:00 · Liga", ["E1#X", "E3#X"]),
                                          ("EUW1_3", "02.10 18:00 · Scrim", ["P1#Y"])):
@@ -241,10 +335,11 @@ class TestKnownPlayers:
                                      "enemy": [{"riot_id": r, "champion": "Ahri"} for r in enemies],
                                      "enemy_bans": ["Camille"]}, label)
 
-        players = await scouting.known_players("agh")
-        history = await scouting.history_against_us("AGH")
+        players, source = await scouting.known_players("cockpit")
+        history = await scouting.history_against_us("Cockpit")
 
         assert players[0] == "E1#X" and set(players) == {"E1#X", "E2#X", "E3#X"}
+        assert source == "nasze gry z nimi (2 mapy)"
         assert history["games"] == 2 and history["bans"]["Camille"] == 2
 
 
@@ -256,7 +351,7 @@ class TestAutoScouting:
         lp_bot = bot_module.LPTrackerBot()
         channel = SimpleNamespace(send=AsyncMock())
         monkeypatch.setattr(lp_bot, "get_reminder_channel", AsyncMock(return_value=channel))
-        monkeypatch.setattr(bot_module.scouting, "known_players", AsyncMock(return_value=["A#1"]))
+        monkeypatch.setattr(bot_module.scouting, "known_players", AsyncMock(return_value=(["A#1"], "zakładka Przeciwnicy")))
         monkeypatch.setattr(bot_module.scouting, "start_scouting", lambda *args: lp_bot.started.append(args))
         lp_bot.started = []
         return lp_bot

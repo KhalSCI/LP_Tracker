@@ -4,6 +4,13 @@ from discord.ext import commands
 
 import database as db
 import scouting
+from config import SCOUT_MONTHS
+
+PERIODS = [
+    app_commands.Choice(name="3 miesiące", value=3),
+    app_commands.Choice(name="6 miesięcy", value=6),
+    app_commands.Choice(name="12 miesięcy", value=12),
+]
 
 
 class ScoutingCog(commands.Cog):
@@ -13,22 +20,26 @@ class ScoutingCog(commands.Cog):
         self.bot = bot
 
     async def team_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-        """Saved opponent teams."""
+        """Teams from the Przeciwnicy tab and ones saved with /scout."""
         return [
-            app_commands.Choice(name=team["name"], value=team["name"])
-            for team in await db.get_opponents()
-            if current.lower() in team["name"].lower()
+            app_commands.Choice(name=name, value=name)
+            for name in await scouting.team_names()
+            if current.lower() in name.lower()
         ][:25]
 
-    @app_commands.command(name="scout", description="Scouting przeciwnika: pule championów z tego i poprzedniego sezonu, bany")
+    @app_commands.command(name="scout", description="Scouting przeciwnika: pule championów z ostatnich miesięcy, bany")
     @app_commands.describe(
-        druzyna="Nazwa drużyny (jak w kolumnie Przeciwnik w zakładce Mecze)",
-        gracze="Linki multi op.gg (np. EUW i EUNE, oddzielone spacją) albo Riot ID po przecinku; zapamiętam je",
+        druzyna="Nazwa drużyny (jak w zakładce Przeciwnicy i w kolumnie Przeciwnik w Meczach)",
+        gracze="Zamiast zakładki Przeciwnicy: linki multi op.gg (EUW i EUNE, oddzielone spacją) albo Riot ID po przecinku",
+        okres=f"Z jakiego okresu brać gry (domyślnie {SCOUT_MONTHS} miesięcy)",
     )
     @app_commands.autocomplete(druzyna=team_autocomplete)
-    async def scout(self, interaction: discord.Interaction, druzyna: str, gracze: str = None):
+    @app_commands.choices(okres=PERIODS)
+    async def scout(self, interaction: discord.Interaction, druzyna: str, gracze: str = None,
+                    okres: app_commands.Choice[int] = None):
         await interaction.response.defer()
         druzyna = druzyna.strip()
+        months = okres.value if okres else SCOUT_MONTHS
 
         if gracze:
             players = scouting.parse_players(gracze)
@@ -36,23 +47,23 @@ class ScoutingCog(commands.Cog):
                 await interaction.followup.send("❌ Nie widzę tu Riot ID. Podaj link(i) multi op.gg albo np. `Nick#EUW, Nick2#EUNE`.")
                 return
             await db.save_opponent(druzyna, players)
+            source = "podane w komendzie"
         else:
-            players = await scouting.known_players(druzyna)
+            players, source = await scouting.known_players(druzyna)
             if not players:
                 await interaction.followup.send(
-                    f"❌ Nie znam składu **{discord.utils.escape_markdown(druzyna)}**. "
-                    "Podaj `gracze`: link multi op.gg albo Riot ID po przecinku."
+                    f"❌ Nie znam składu **{discord.utils.escape_markdown(druzyna)}**. Wpisz linki multi w zakładce "
+                    f"{scouting.OPPONENTS_TAB} albo podaj `gracze`."
                 )
                 return
 
         queued = " Czekam w kolejce na poprzedni scouting." if scouting.is_running() else ""
         await interaction.followup.send(
-            f"🔎 Scouting **{discord.utils.escape_markdown(druzyna)}** ({len(players)} kont: "
-            f"{discord.utils.escape_markdown(', '.join(players))}).{queued} "
-            "Za pierwszym razem może to potrwać kilkanaście minut, przy kontach z dwóch serwerów nawet pół godziny "
-            "(limit Riot API). Raport wrzucę tutaj."
+            f"🔎 Scouting **{discord.utils.escape_markdown(druzyna)}** z ostatnich {months} mies., "
+            f"{len(players)} kont ({source}): {discord.utils.escape_markdown(', '.join(players))}.{queued} "
+            "Gdy policzę gry do pobrania, napiszę, ile to potrwa; raport wrzucę tutaj."
         )
-        scouting.start_scouting(interaction.channel, druzyna, players)
+        scouting.start_scouting(interaction.channel, druzyna, players, months, announce_progress=True)
 
 
 async def setup(bot: commands.Bot):

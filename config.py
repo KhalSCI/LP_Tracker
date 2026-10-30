@@ -35,8 +35,8 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-6-luna")
 ROASTS_ENABLED = os.getenv("ROASTS_ENABLED", "1") not in ("0", "false", "False", "")
 ROASTS_PER_DAY = int(os.getenv("ROASTS_PER_DAY", 3))  # per player
 
-# Opponent scouting: ranked games read per player and season (current and previous, newest first)
-SCOUT_MAX_GAMES = int(os.getenv("SCOUT_MAX_GAMES", 100))
+# Opponent scouting: default period of ranked and tournament-code games, in months (/scout offers 3, 6, 12)
+SCOUT_MONTHS = int(os.getenv("SCOUT_MONTHS", 6))
 
 # Riot API endpoints
 RIOT_ACCOUNT_API = "https://europe.api.riotgames.com"

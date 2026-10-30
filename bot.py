@@ -384,12 +384,12 @@ class LPTrackerBot(commands.Bot):
             print(f"Error checking match reminders: {e}")
 
     async def scout_opponent(self, channel, opponent: str) -> None:
-        """Start scouting an official's opponent when its players are known (saved or from our games)."""
-        players = await scouting.known_players(opponent)
+        """Start scouting an official's opponent when its players are known (Przeciwnicy tab, saved, or our games)."""
+        players, _ = await scouting.known_players(opponent)
         if players:
             scouting.start_scouting(channel, opponent, players)
         else:
-            print(f"Scouting: no players known for {opponent}, use /scout to add them")
+            print(f"Scouting: no players known for {opponent}, add them to the Przeciwnicy tab")
 
     @check_match_reminders.before_loop
     async def before_reminder_check(self):
