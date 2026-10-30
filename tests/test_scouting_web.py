@@ -60,8 +60,9 @@ class TestRender:
         report["bans"][0]["counter"] = "Syndra ma 45% (600 gier)"
         report["answers"] = [{"role": "Mid", "player": "Maly", "our_players": ["iym"], "picks": [
             {"champion": "Wukong", "tourney": 3, "soloq": 10, "answers": [
-                {"champion": "Camille", "wr": 0.62, "games": 900, "ours": {"scrims": (2, 1), "soloq": (0, 0)}}]},
-            {"champion": "Camille", "tourney": 0, "soloq": 4, "answers": []},
+                {"champion": "Camille", "wr": 0.62, "games": 900, "ours": {"scrims": (2, 1), "soloq": (0, 0)}}],
+             "general": [{"champion": "Taliyah", "wr": 0.54, "games": 994, "ours": {"scrims": (0, 0), "soloq": (0, 0)}}]},
+            {"champion": "Camille", "tourney": 0, "soloq": 4, "answers": [], "general": []},
         ]}]
 
         page = scouting_web.render_report(report)
@@ -71,6 +72,8 @@ class TestRender:
         assert "<h2>Nasze odpowiedzi</h2>" in page and "3 turn. · 10 SoloQ" in page
         assert 'class="wr good">62%</span><small>900 gier · scrimy 1-1</small>' in page
         assert "brak danych o matchupach z naszą pulą" in page
+        assert ('<span class="lbl">ogólnie</span><div class="chips general"><span class="chip answer">' in page
+                and "<b>Taliyah</b>" in page and "<small>994 gry</small>" in page)
 
     def test_unknown_champion_gets_an_empty_icon(self):
         assert scouting_web.icon("Nowy Champion") == '<span class="icon"></span>'

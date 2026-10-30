@@ -60,7 +60,9 @@ h2 { font-size:18px; margin:34px 0 12px; padding-bottom:6px; border-bottom:1px s
 .pick { display:grid; grid-template-columns:minmax(130px,170px) 1fr; gap:10px; padding:8px 14px; border-top:1px solid var(--border); align-items:center; }
 .pick:first-of-type { border-top:none; } .pick .them { display:flex; align-items:center; gap:8px; }
 .pick .them small { display:block; color:var(--muted); font-size:12px; }
+.options { display:grid; grid-template-columns:auto 1fr; gap:6px 8px; align-items:center; } .options .lbl { color:var(--muted); font-size:12px; }
 .pick .chips { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); } .pick .chips > .meta { grid-column:1 / -1; }
+.chips.general .chip { background:transparent; }
 .chip.answer { border-radius:10px; padding:4px 8px 4px 4px; min-width:0; } .chip.answer > span { min-width:0; white-space:nowrap; }
 .chip.answer b { font-weight:500; } .chip.answer small { display:block; color:var(--muted); font-size:11px; overflow:hidden; text-overflow:ellipsis; }
 @media (max-width:700px) { .pick { grid-template-columns:1fr; } .pick .chips { grid-template-columns:repeat(2,minmax(0,1fr)); } }
@@ -230,24 +232,32 @@ def ban_card(ban: dict) -> str:
     )
 
 
+def answer_chips(answers: list[dict]) -> str:
+    """Answers as two-line chips: champion and matchup win rate, then games and our record."""
+    return "".join(
+        f'<span class="chip answer">{icon(a["champion"])}<span><b>{escape(a["champion"])}</b> {wr_cell(a["wr"])}'
+        f'<small>{games_count(a["games"])}'
+        + (f' · scrimy {scouting.record_text(a["ours"]["scrims"])}' if a["ours"]["scrims"][0] else "")
+        + (f' · SoloQ {scouting.record_text(a["ours"]["soloq"])}' if a["ours"]["soloq"][0] else "")
+        + "</small></span></span>"
+        for a in answers
+    )
+
+
 def answers_section(answers: list[dict]) -> str:
-    """Per role: the opponent's likeliest picks and our answers with matchup win rates."""
+    """Per role: the opponent's likeliest picks, our answers and the best ones overall, with matchup win rates."""
     roles = ""
     for role in answers:
         picks = ""
         for pick in role["picks"]:
             counts = " · ".join(part for part in (
                 f"{pick['tourney']} turn." if pick["tourney"] else "", f"{pick['soloq']} SoloQ" if pick["soloq"] else "") if part)
-            chips_html = "".join(
-                f'<span class="chip answer">{icon(a["champion"])}<span><b>{escape(a["champion"])}</b> {wr_cell(a["wr"])}'
-                f'<small>{games_count(a["games"])}'
-                + (f' · scrimy {scouting.record_text(a["ours"]["scrims"])}' if a["ours"]["scrims"][0] else "")
-                + (f' · SoloQ {scouting.record_text(a["ours"]["soloq"])}' if a["ours"]["soloq"][0] else "")
-                + "</small></span></span>"
-                for a in pick["answers"]
-            ) or '<span class="meta">brak danych o matchupach z naszą pulą</span>'
+            ours = answer_chips(pick["answers"]) or '<span class="meta">brak danych o matchupach z naszą pulą</span>'
+            general = answer_chips(pick["general"]) or '<span class="meta">brak danych</span>'
             picks += (f'<div class="pick"><div class="them">{icon(pick["champion"])}<div>{escape(pick["champion"])}'
-                      f'<small>{escape(counts)}</small></div></div><div class="chips">{chips_html}</div></div>')
+                      f'<small>{escape(counts)}</small></div></div><div class="options">'
+                      f'<span class="lbl">nasi</span><div class="chips">{ours}</div>'
+                      f'<span class="lbl">ogólnie</span><div class="chips general">{general}</div></div></div>')
         roles += (
             f'<article class="card answer-role"><header><span class="role">{escape(role["role"])}</span>'
             f'<b>{escape(role["player"])}</b> nasi: {escape(", ".join(role["our_players"]) or "-")}</header>{picks}</article>'
@@ -296,9 +306,10 @@ def render_report(report: dict, index_url: str = "") -> str:
              else '<p class="meta">Za mało gier, żeby coś zasugerować.</p>')
 
     if report.get("answers"):
-        body += ('<h2>Nasze odpowiedzi</h2><p class="meta">Ich najczęstsze picki na każdej roli (turnieje, potem SoloQ) i '
-                 'najlepsze odpowiedzi z naszej puli na tej roli: WR matchupu na Emerald+ (OP.GG), liczba gier i nasze wyniki '
-                 'w tym matchupie.</p>' + answers_section(report["answers"]))
+        body += ('<h2>Nasze odpowiedzi</h2><p class="meta">Ich najczęstsze picki na każdej roli (turnieje, potem SoloQ). '
+                 '„nasi”: najlepsze odpowiedzi z puli naszego gracza na tej roli; „ogólnie”: najlepsze kontry według OP.GG '
+                 f'(championy grane na tej roli, min. {scouting.MIN_GENERAL_GAMES} gier). WR matchupu na Emerald+, liczba gier '
+                 'i nasze wyniki w tym matchupie.</p>' + answers_section(report["answers"]))
 
     body += "<h2>Gracze</h2>" + "".join(player_card(p) for p in report["players"])
 

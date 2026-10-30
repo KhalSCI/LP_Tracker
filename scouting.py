@@ -90,6 +90,10 @@ THEIR_PICKS = 4
 OUR_ROLE_POOL = 8
 ANSWERS_PER_PICK = 5
 MIN_MATCHUP_GAMES = 100
+# Best answers overall (any champion, not only our pool): matchups won more often than lost, of at least
+# MIN_GENERAL_GAMES games and GENERAL_MIN_SHARE of the pick's games (champions really played in the role)
+MIN_GENERAL_GAMES = 300
+GENERAL_MIN_SHARE = 0.005
 # Tags of suggested bans: comfort picks of theirs, champions that beat what we play most (our
 # OUR_MAIN_PICKS per role, scrims counting SCRIM_WEIGHT times), and strong pro-meta champions
 OUR_MAIN_PICKS = 2
@@ -168,6 +172,7 @@ BAN_COLUMNS = [("Champion", "name"), ("Tagi", "text"), ("SoloQ gry", "int"), ("S
 THEIR_PICK_COLUMNS = [("Ich pick", "name"), ("Turnieje", "int"), ("SoloQ", "int")]
 ANSWER_COLUMNS = [("Nasza odpowiedź", "name"), ("WR Emerald+", "wr"), ("Gry", "int"), ("Nasze scrimy", "text"),
                   ("Nasze SoloQ", "text")]
+GENERAL_COLUMNS = [("Ogólnie (OP.GG)", "name"), ("WR Emerald+", "wr"), ("Gry", "int")]
 PRO_COLUMNS = [("Champion", "name"), ("Picki", "int"), ("Bany", "int"), ("P+B", "pct"), ("WR", "pct"),
                ("Śr. tura bana", "dec1"), ("Śr. runda picku", "dec1"), ("Role", "text")]
 SHEET_COLS = 26
@@ -1281,10 +1286,25 @@ def matchup_pairs(report: dict, our: list[dict]) -> set[tuple[str, str]]:
     return pairs
 
 
+def general_answers(tables: dict, champion: str, role: str) -> list[dict]:
+    """
+    The best answers to a champion overall by OP.GG, from its own matchup table: opponents
+    that beat it in matchups of MIN_GENERAL_GAMES games and GENERAL_MIN_SHARE of its games,
+    as {"champion", "wr", "games"}, best first.
+    """
+    table = tables.get((champion, role), {})
+    min_games = max(MIN_GENERAL_GAMES, GENERAL_MIN_SHARE * sum(games for games, _ in table.values()))
+    answers = [{"champion": opponent, "wr": 1 - wins / games, "games": games}
+               for opponent, (games, wins) in table.items() if games >= min_games and wins / games < 0.5]
+    answers.sort(key=lambda a: -a["wr"])
+    return answers[:ANSWERS_PER_PICK]
+
+
 def role_answers(report: dict, our: list[dict], tables: dict) -> list[dict]:
     """
-    For each role: the opponent's likeliest picks there and our best answers from our pool
-    on that role, by OP.GG's matchup win rate (with our own record in that matchup).
+    For each role: the opponent's likeliest picks there, our best answers from our pool on
+    that role ("answers") and the best answers overall ("general"), by OP.GG's matchup win
+    rate (with our own record in that matchup).
     """
     result = []
     for role, player in sorted(players_by_role(report).items(), key=lambda item: ROLES.index(item[0])):
@@ -1298,7 +1318,9 @@ def role_answers(report: dict, our: list[dict], tables: dict) -> list[dict]:
                     answers.append({"champion": champion, "wr": matchup[0], "games": matchup[1],
                                     "ours": our_record(our, role, champion, pick["champion"])})
             answers.sort(key=lambda a: -a["wr"])
-            picks.append(dict(pick, answers=answers[:ANSWERS_PER_PICK]))
+            general = [dict(a, ours=our_record(our, role, a["champion"], pick["champion"]))
+                       for a in general_answers(tables, pick["champion"], role)]
+            picks.append(dict(pick, answers=answers[:ANSWERS_PER_PICK], general=general))
         result.append({
             "role": role, "player": player["name"], "picks": picks,
             "our_players": [m["nick"] for m in our if m["role"] == role],
@@ -1647,22 +1669,34 @@ def build_sheet_rows(report: dict) -> tuple[list[list], dict]:
 
     if report.get("answers"):
         add()
-        layout["sections"].append(add((0, ["Nasze odpowiedzi per rola (WR matchupu z OP.GG, Emerald+; nasze wyniki w tym matchupie)"])))
+        layout["sections"].append(add((0, [
+            "Nasze odpowiedzi per rola (WR matchupu z OP.GG, Emerald+; nasze wyniki w tym matchupie), obok najlepsze ogólnie"])))
         for role in report["answers"]:
             layout["labels"].append(add((0, [
                 f"{role['role']} · ich gracz: {role['player']} · nasi: {', '.join(role['our_players']) or '-'}"])))
-            header = add((0, [name for name, _ in THEIR_PICK_COLUMNS]), (BLOCK_STARTS[1], [name for name, _ in ANSWER_COLUMNS]))
+            header = add((0, [name for name, _ in THEIR_PICK_COLUMNS]), (BLOCK_STARTS[1], [name for name, _ in ANSWER_COLUMNS]),
+                         (BLOCK_STARTS[2], [name for name, _ in GENERAL_COLUMNS]))
             for pick in role["picks"]:
                 first = add((0, [pick["champion"], pick["tourney"] or "", pick["soloq"] or ""]))
-                for i, answer in enumerate(pick["answers"] or [None]):
+                for i in range(max(len(pick["answers"]), len(pick["general"]), 1)):
                     row = first if i == 0 else add()
-                    grid[row][BLOCK_STARTS[1]:BLOCK_STARTS[1] + len(ANSWER_COLUMNS)] = (
-                        [answer["champion"], share(answer["wr"]), answer["games"], record_text(answer["ours"]["scrims"]),
-                         record_text(answer["ours"]["soloq"])] if answer else ["brak danych", "", "", "", ""]
-                    )
+                    if i < len(pick["answers"]):
+                        answer = pick["answers"][i]
+                        grid[row][BLOCK_STARTS[1]:BLOCK_STARTS[1] + len(ANSWER_COLUMNS)] = [
+                            answer["champion"], share(answer["wr"]), answer["games"], record_text(answer["ours"]["scrims"]),
+                            record_text(answer["ours"]["soloq"])]
+                    elif i == 0:
+                        grid[row][BLOCK_STARTS[1]] = "brak danych"
+                    if i < len(pick["general"]):
+                        general = pick["general"][i]
+                        grid[row][BLOCK_STARTS[2]:BLOCK_STARTS[2] + len(GENERAL_COLUMNS)] = [
+                            general["champion"], share(general["wr"]), general["games"]]
+                    elif i == 0:
+                        grid[row][BLOCK_STARTS[2]] = "brak danych"
             layout["tables"] += [
                 (header, len(grid), 0, [kind for _, kind in THEIR_PICK_COLUMNS]),
                 (header, len(grid), BLOCK_STARTS[1], [kind for _, kind in ANSWER_COLUMNS]),
+                (header, len(grid), BLOCK_STARTS[2], [kind for _, kind in GENERAL_COLUMNS]),
             ]
 
     history = report["history"]

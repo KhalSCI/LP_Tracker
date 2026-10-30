@@ -333,6 +333,19 @@ class TestAnswers:
         assert [(a["champion"], a["wr"]) for a in veigar["answers"]] == [("Akali", 0.6)]
         assert mid["picks"][0]["champion"] == "Syndra" and mid["picks"][0]["answers"] == []
         assert scouting.answer_line(mid) == "**Mid**: Viktor → Syndra 52%, Orianna 50%, Ahri 45%"
+        # Overall: Kassadin beats Syndra over 600 games; Viktor's 1000 games against it are a loss
+        assert [(a["champion"], round(a["wr"], 2), a["games"]) for a in mid["picks"][0]["general"]] == [("Kassadin", 0.55, 600)]
+
+    def test_general_answers_need_big_common_matchups(self):
+        table = {"Talon": (762, 312), "Kassadin": (1415, 594), "Zac": (111, 43), "Karthus": (400, 170),
+                 "Lux": (2155, 970), "Ahri": (90000, 47000), "Fizz": (2023, 890), "Vel'Koz": (679, 299), "Yone": (900, 410)}
+        tables = {("Viktor", "Mid"): table}
+
+        answers = scouting.general_answers(tables, "Viktor", "Mid")
+
+        # Zac has too few games, Karthus too small a share (400 of ~108k), Ahri loses; five best of the rest
+        assert [a["champion"] for a in answers] == ["Talon", "Kassadin", "Fizz", "Vel'Koz", "Lux"]
+        assert scouting.general_answers(tables, "Veigar", "Mid") == []
 
     def test_counters_and_tags(self):
         report = report_with([self.enemy_mid()])
@@ -360,8 +373,9 @@ class TestAnswers:
         viktor = next(i for i in range(label, len(rows)) if rows[i][0] == "Viktor")
         assert rows[viktor][:3] == ["Viktor", "", 8] and rows[viktor][9:14] == ["Syndra", 0.52, 1000, "", "1-1"]
         assert rows[viktor + 1][0] == "" and rows[viktor + 1][9] == "Orianna"
-        assert rows[label + 2][0] == "Syndra" and rows[label + 2][9] == "brak danych"
-        assert label in layout["labels"] and (label + 1, 9) in [(t[0], t[2]) for t in layout["tables"]]
+        assert rows[label + 1][18] == "Ogólnie (OP.GG)" and rows[viktor][18:21] == ["Syndra", 0.52, 1000]
+        assert rows[label + 2][0] == "Syndra" and rows[label + 2][9] == "brak danych" and rows[label + 2][18:21] == ["Kassadin", 0.55, 600]
+        assert label in layout["labels"] and {(label + 1, 9), (label + 1, 18)} <= {(t[0], t[2]) for t in layout["tables"]}
 
 
 class TestSummarize:
