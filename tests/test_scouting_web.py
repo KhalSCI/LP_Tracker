@@ -26,7 +26,7 @@ def sample_report(**fields) -> dict:
     top = player(summarize(games("Camille", 2, 4), NOW, 6, {}), account("<b>Bad</b>#EUW"))
     history = {"games": 2, "wins": 1, "players": Counter(), "picks": Counter({"Camille": 2}), "bans": Counter()}
     defaults = {
-        "team": "Średni & Łobuzy", "summary": "• banujcie Wukonga\n• uważać na jungle", "history": history,
+        "team": "Średni & Łobuzy", "summary": "• banujcie **Wukonga**\n• uważać na <jungle>", "history": history,
         "pro_meta": {"wukong": {"champion": "Wukong", "picks": 10, "bans": 23, "presence": 0.33, "wr": 0.53}},
     }
     return report_with([top, jungle, {"riot_id": "X#1", "error": "Nie znaleziono konta"}], **{**defaults, **fields})
@@ -40,10 +40,10 @@ class TestRender:
 
         assert page.startswith("<!doctype html>") and '<meta name="robots" content="noindex,nofollow">' in page
         assert "Scouting: <span>Średni &amp; Łobuzy</span>" in page
-        assert "<li>banujcie Wukonga</li>" in page
+        assert "<li>banujcie <strong>Wukonga</strong></li>" in page and "uważać na &lt;jungle&gt;" in page
         assert "&lt;b&gt;Bad&lt;/b&gt;#EUW" in page and "<b>Bad</b>" not in page
         assert "https://ddragon.leagueoflegends.com/cdn/16.21.1/img/champion/MonkeyKing.png" in page
-        assert "EUW + EUNE: jeden gracz" in page and "SoloQ nie liczone" in page
+        assert "2 konta: jeden gracz" in page and "SoloQ nie liczone" in page
         assert "Nie znaleziono konta" in page
         assert 'class="wr good">83%' in page  # Wukong 5-1
         assert "Przeciwko nam" in page and "Camille ×2" in page

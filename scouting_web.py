@@ -49,6 +49,7 @@ h2 { font-size:18px; margin:34px 0 12px; padding-bottom:6px; border-bottom:1px s
 .srv { font:600 11px var(--mono); border:1px solid var(--border); border-radius:4px; padding:0 5px; margin-right:4px; color:var(--text); }
 .tag { display:inline-block; font-size:12px; border-radius:4px; padding:1px 7px; margin-left:4px; }
 .tag.warn { background:rgba(248,113,113,.15); color:var(--bad); } .tag.note { background:rgba(139,149,161,.15); color:var(--muted); }
+.tag.hint { background:rgba(250,204,21,.12); color:#facc15; }
 .blocks { display:grid; grid-template-columns:repeat(3,1fr); gap:0; }
 .block { padding:12px 16px; border-left:1px solid var(--border); } .block:first-child { border-left:none; }
 .block h4 { margin:0 0 8px; font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
@@ -101,6 +102,11 @@ def icon(champion: str, big: bool = False) -> str:
     return f'<img class="icon{" big" if big else ""}" src="{escape(url)}" alt="" loading="lazy">'
 
 
+def inline_markdown(text: str) -> str:
+    """Escaped text with the model's **bold** as real bold."""
+    return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escape(text))
+
+
 def page(title: str, body: str) -> str:
     return (
         "<!doctype html><html lang=\"pl\"><head><meta charset=\"utf-8\">"
@@ -137,12 +143,13 @@ def player_card(player: dict) -> str:
         f'<span><span class="srv">{escape(scouting.server_name(a["platform"]))}</span>{escape(a["riot_id"])} · '
         f'{escape(scouting.rank_text(a["ranks"].get("solo")))}'
         + (f'<span class="tag note">SoloQ nie liczone</span>' if merged and a["policy"]["skipped"] else "")
+        + (f'<span class="tag hint">{escape(a["role_note"])}</span>' if a.get("role_note") else "")
         + "</span>"
         for a in player["accounts"]
     )
     tags = ""
     if merged:
-        tags += '<span class="tag note">EUW + EUNE: jeden gracz</span>'
+        tags += f'<span class="tag note">{len(player["accounts"])} konta: jeden gracz</span>'
     if s["one_trick"]:
         tags += f'<span class="tag warn">one-trick: {escape(s["one_trick"]["champion"])} ({scouting.pct(s["one_trick"]["share"])} gier)</span>'
 
@@ -196,7 +203,7 @@ def render_report(report: dict, index_url: str = "") -> str:
 
     if report["summary"]:
         items = "".join(
-            f"<li>{escape(line.strip().lstrip('•').strip())}</li>" for line in report["summary"].splitlines() if line.strip()
+            f"<li>{inline_markdown(line.strip().lstrip('•').strip())}</li>" for line in report["summary"].splitlines() if line.strip()
         )
         body += f'<h2>Podsumowanie</h2><section class="card summary"><ul>{items}</ul></section>'
 

@@ -49,8 +49,9 @@ class ScoutingCog(commands.Cog):
                 return
             await db.save_opponent(druzyna, players)
             source = "podane w komendzie"
+            roles = await scouting.sheet_roles(druzyna)
         else:
-            players, source = await scouting.known_players(druzyna)
+            players, source, roles = await scouting.known_players(druzyna)
             if not players:
                 await interaction.followup.send(
                     f"❌ Nie znam składu **{discord.utils.escape_markdown(druzyna)}**. Wpisz linki multi w zakładce "
@@ -66,7 +67,7 @@ class ScoutingCog(commands.Cog):
             "Gdy policzę gry do pobrania, napiszę, ile to potrwa; raport wrzucę tutaj."
         )
         scouting.start_scouting(interaction.channel, druzyna, players, months, announce_progress=True,
-                                tourney_months=tourney_months)
+                                tourney_months=tourney_months, roles=roles)
 
 
 async def setup(bot: commands.Bot):

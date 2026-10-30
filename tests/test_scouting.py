@@ -16,7 +16,7 @@ from config import TIMEZONE
 from scouting import (
     parse_players, season_of, parse_patches, parse_champion_table, combine_pro_tables, champion_key, summarize,
     ban_suggestions, recent_months, build_sheet_rows, build_sheet_format, scout_rows, parse_opponent_rows,
-    ranked_policy, same_player_pairs, group_accounts, account_text, SHEET_COLS, MONTH_SECONDS,
+    ranked_policy, group_accounts, merged_summary, account_text, similar_names, role_evidence, SHEET_COLS, MONTH_SECONDS,
 )
 
 YEAR = 2026
@@ -38,7 +38,7 @@ GOLGG_HTML = """
 
 
 def game(champion: str, win=True, days_ago=10, queue=420, role="Top", season=YEAR, puuid="p1", n=0) -> dict:
-    return {"puuid": puuid, "match_id": f"EUW1_{champion}_{days_ago}_{queue}_{n}", "queue_id": queue,
+    return {"puuid": puuid, "match_id": f"EUW1_{puuid}_{champion}_{days_ago}_{queue}_{n}", "queue_id": queue,
             "game_start": (NOW - days_ago * DAY) * 1000, "season": season, "champion": champion, "role": role,
             "win": win, "kills": 5, "deaths": 2, "assists": 5}
 
@@ -219,26 +219,72 @@ class TestSummarize:
         assert (bans[1]["ranked_games"], bans[1]["tourney_games"], bans[1]["tourney_wr"]) == (0, 3, 2 / 3)
 
 
-class TestMergingAccounts:
-    """Test cases for treating an EUW and an EUNE account of one role as one player."""
+class TestFivePlayers:
+    """Test cases for splitting a team's accounts into five players."""
 
-    def with_role(self, acc: dict, role: str) -> dict:
-        acc["summary"] = {"role": role}
-        return acc
+    def team(self, eune_order: list[str]) -> tuple[list[dict], dict]:
+        """Five EUW accounts in role order and five EUNE ones (in eune_order) with their games."""
+        euw = {role: account(f"{role}#EUW") for role in ("Top", "Jungle", "Mid", "ADC", "Support")}
+        eune = {role: account(f"e{role}#EUNE", "eun1") for role in ("Top", "Jungle", "Mid", "ADC", "Support")}
+        played = {a["puuid"]: games("Ahri", 20, 0, role=role, puuid=a["puuid"]) for role, a in euw.items()}
+        played[eune["Top"]["puuid"]] = games("Gnar", 8, 0, role="Top", puuid=eune["Top"]["puuid"])
+        played[eune["Jungle"]["puuid"]] = []  # nothing to go by
+        for role in ("Mid", "ADC", "Support"):
+            puuid = eune[role]["puuid"]
+            played[puuid] = games("Azir", 10, 0, queue=3130, role=role, puuid=puuid, days_ago=30)
+        return list(euw.values()) + [eune[role] for role in eune_order], played
 
-    def test_pairs(self):
-        jungle_euw = self.with_role(account("Sredni#pit"), "Jungle")
-        jungle_eune = self.with_role(account("Lumino#INT", "eun1", "DIAMOND"), "Jungle")
-        mid_euw = self.with_role(account("Maly#pit"), "Mid")
-        mids_eune = [self.with_role(account(f"Mid{i}#EUNE", "eun1"), "Mid") for i in range(2)]
-        top_euw = self.with_role(account("Kurczak#small"), "Top")
-        unknown = self.with_role(account("New#EUNE", "eun1"), "")
+    def split(self, accounts: list[dict], played: dict, roles: dict = None) -> list[tuple]:
+        players = group_accounts(accounts, played, NOW, 6, {}, 6, roles)
+        return [(p["summary"]["role"], [a["riot_id"] for a in p["accounts"]]) for p in players]
 
-        pairs = same_player_pairs([jungle_euw, mid_euw, *mids_eune, jungle_eune, top_euw, unknown])
+    def test_ten_accounts_become_five_players(self):
+        accounts, played = self.team(["ADC", "Jungle", "Mid", "Support", "Top"])
 
-        assert pairs == [(jungle_euw, jungle_eune)]
+        assert self.split(accounts, played) == [
+            ("Top", ["Top#EUW", "eTop#EUNE"]),
+            ("Jungle", ["Jungle#EUW", "eJungle#EUNE"]),
+            ("Mid", ["Mid#EUW", "eMid#EUNE"]),
+            ("ADC", ["ADC#EUW", "eADC#EUNE"]),
+            ("Support", ["Support#EUW", "eSupport#EUNE"]),
+        ]
+        assert accounts[6]["role_note"] == "brak gier, rola z dopasowania"  # eJungle
 
-    def test_merged_player(self):
+    def test_accounts_from_one_game_are_two_players(self):
+        accounts, played = self.team(["Top", "Jungle", "Mid", "ADC", "Support"])
+        shared = dict(games("Orianna", 1, 0, role="Mid", days_ago=5)[0], match_id="EUW1_shared")
+        for puuid in ("Mid#EUW", "eMid#EUNE"):
+            played[puuid] = played[puuid] + [dict(shared, puuid=puuid)]
+
+        split = dict(self.split(accounts, played))
+
+        assert "eMid#EUNE" not in split["Mid"]
+
+    def test_roles_from_the_sheet_are_kept(self):
+        accounts, played = self.team(["Top", "Jungle", "Mid", "ADC", "Support"])
+
+        split = dict(self.split(accounts, played, {"ADC": ["eJungle"], "Jungle": ["eADC#EUNE"]}))
+
+        assert split["ADC"] == ["ADC#EUW", "eJungle#EUNE"] and split["Jungle"] == ["Jungle#EUW", "eADC#EUNE"]
+        assert next(a for a in accounts if a["riot_id"] == "eADC#EUNE")["role_note"] == "rola z arkusza"
+
+    def test_fewer_than_five_accounts_stay_apart(self):
+        accounts = [account("A#EUW"), account("B#EUNE", "eun1"), account("C#EUW")]
+        played = {a["puuid"]: games("Ahri", 5, 0, role="Mid", puuid=a["puuid"]) for a in accounts}
+        assert sorted(len(p["accounts"]) for p in group_accounts(accounts, played, NOW, 6, {}, 6)) == [1, 1, 1]
+
+    def test_recent_games_decide_the_role(self):
+        played = games("Ahri", 40, 0, role="Mid", days_ago=200) + games("Gnar", 6, 0, role="Top", days_ago=5)
+        assert role_evidence(played, NOW * 1000).most_common(1)[0][0] == "Top"
+        assert role_evidence(played).most_common(1)[0][0] == "Mid"
+        # Too few recent games: all of them count
+        assert role_evidence(played[:40] + played[-2:], NOW * 1000).most_common(1)[0][0] == "Mid"
+
+    def test_similar_names(self):
+        assert similar_names("iym#0509", "iym999#0409")
+        assert not similar_names("OpenYourMind#MAGIK", "Khal#UwU")
+
+    def test_merged_summary(self):
         euw, eune = account("Sredni#pit"), account("Lumino#INT", "eun1", "DIAMOND")
         played = {
             euw["puuid"]: games("Lee Sin", 5, 1, role="Jungle", puuid=euw["puuid"])
@@ -247,33 +293,25 @@ class TestMergingAccounts:
             eune["puuid"]: games("Graves", 10, 0, role="Jungle", puuid=eune["puuid"])
             + games("Xin Zhao", 1, 1, queue=3130, role="Jungle", puuid=eune["puuid"], days_ago=40),
         }
-        for acc in (euw, eune):
-            acc["summary"] = summarize(played[acc["puuid"]], NOW, 6, {}, acc["policy"])
-        error = {"riot_id": "X#1", "error": "Nie znaleziono konta"}
 
-        players = group_accounts([eune, error, euw], played, NOW, 6, {}, 6)
+        summary = merged_summary([euw, eune], played, NOW, 6, {}, 6)
 
-        merged = players[0]
-        assert merged["name"] == "Sredni / Lumino" and [a["riot_id"] for a in merged["accounts"]] == ["Sredni#pit", "Lumino#INT"]
-        assert [(c["champion"], c["games"]) for c in merged["summary"]["ranked"]] == [("Lee Sin", 6)]
-        assert [(c["champion"], c["games"], c["wins"]) for c in merged["summary"]["tournament"]] == [("Xin Zhao", 4, 3)]
-        assert players[1] == error and len(players) == 2
+        assert [(c["champion"], c["games"]) for c in summary["ranked"]] == [("Lee Sin", 6)]
+        assert [(c["champion"], c["games"], c["wins"]) for c in summary["tournament"]] == [("Xin Zhao", 4, 3)]
 
     def test_eune_master_soloq_counts_when_merged(self):
         euw, eune = account("A#EUW"), account("B#EUNE", "eun1", "MASTER")
         played = {euw["puuid"]: games("Ahri", 2, 0, role="Mid", puuid="A#EUW"),
                   eune["puuid"]: games("Syndra", 3, 0, role="Mid", puuid="B#EUNE")}
-        for acc in (euw, eune):
-            acc["summary"] = summarize(played[acc["puuid"]], NOW, 6, {}, acc["policy"])
-
-        [merged] = group_accounts([euw, eune], played, NOW, 6, {}, 6)
-
-        assert [c["champion"] for c in merged["summary"]["ranked"]] == ["Syndra", "Ahri"]
+        summary = merged_summary([euw, eune], played, NOW, 6, {}, 6)
+        assert [c["champion"] for c in summary["ranked"]] == ["Syndra", "Ahri"]
 
     def test_account_text(self):
         eune = account("Lumino#INT", "eun1", "DIAMOND")
         assert account_text(eune, merged=False) == "Lumino#INT (EUNE, SoloQ: Diamond I 50 LP, 10-10 (50%))"
         assert account_text(eune, merged=True).endswith(", nie liczę, konto EUNE poniżej Mastera)")
+        eune["role_note"] = "gra głównie Mid"
+        assert account_text(eune, merged=False).endswith(", gra głównie Mid)")
 
 
 class TestSheetRows:
@@ -479,7 +517,8 @@ class TestFetching:
 
         progress.assert_awaited_once_with(3)
         assert report["fetched"] == 3 and report["months"] == 6
-        assert [c["champion"] for c in report["players"][1]["summary"]["tournament"]] == ["Azir"]
+        b = next(p for p in report["players"] if p["name"] == "b")
+        assert [c["champion"] for c in b["summary"]["tournament"]] == ["Azir"]
 
     def test_remake_row(self):
         data = payload("EUW1_9", {"a": "Camille"})
@@ -505,8 +544,15 @@ class TestKnownPlayers:
 
     def test_parse_opponent_rows(self):
         teams = parse_opponent_rows(OPPONENTS_ROWS)
-        assert teams == {"cockpit": {"name": "Cockpit", "players": ["A#EUW", "B#EUW", "C#EUNE"]},
-                         "agh": {"name": "AGH", "players": ["D#EUW", "E#EUW"]}}
+        assert teams == {"cockpit": {"name": "Cockpit", "players": ["A#EUW", "B#EUW", "C#EUNE"], "roles": {}},
+                         "agh": {"name": "AGH", "players": ["D#EUW", "E#EUW"], "roles": {}}}
+
+    def test_role_columns(self):
+        rows = [OPPONENTS_ROWS[0] + ["Top", "Jungle", "Mid", "ADC", "Support"],
+                ["Cockpit", "A#EUW, B#EUW", "", "", "", "Lumino#INT; B", "", "", ""]]
+        teams = parse_opponent_rows(rows)
+        assert teams["cockpit"]["roles"] == {"Jungle": ["Lumino#INT", "B"]}
+        assert teams["cockpit"]["players"] == ["A#EUW", "B#EUW", "Lumino#INT"]
 
     @pytest.fixture
     def sheet(self, monkeypatch):
@@ -519,12 +565,12 @@ class TestKnownPlayers:
     async def test_sheet_first(self, sheet):
         await db.init_db()
         await db.save_opponent("Cockpit", ["Old#1"])
-        assert await scouting.known_players(" cockpit ") == (["A#EUW", "B#EUW", "C#EUNE"], "zakładka Przeciwnicy")
+        assert await scouting.known_players(" cockpit ") == (["A#EUW", "B#EUW", "C#EUNE"], "zakładka Przeciwnicy", {})
 
     async def test_saved_players_when_not_in_sheet(self, sheet):
         await db.init_db()
         await db.save_opponent("AGH Esports", ["A#1", "B#2"])
-        assert await scouting.known_players("agh esports") == (["A#1", "B#2"], "zapisane z /scout")
+        assert await scouting.known_players("agh esports") == (["A#1", "B#2"], "zapisane z /scout", {})
         assert set(await scouting.team_names()) == {"Cockpit", "AGH", "AGH Esports"}
 
     async def test_missing_tab_is_added_with_opponents_from_mecze(self, sheet):
@@ -532,11 +578,12 @@ class TestKnownPlayers:
         sheet.read_tab.side_effect = gspread.WorksheetNotFound("Przeciwnicy")
         sheet.read_matches.return_value = [["Data", "Przeciwnik"], [1, "Cockpit"], [2, "francja"], [3, "Cockpit"], [4, ""]]
 
-        assert await scouting.known_players("Cockpit") == ([], "")
+        assert await scouting.known_players("Cockpit") == ([], "", {})
 
         tab, updates, *_ = sheet.create_tab.await_args.args
         assert tab == "Przeciwnicy"
-        assert {"range": "A4:D4", "values": [["Drużyna", "Multi EUW", "Multi EUNE", "Notatki"]]} in updates
+        assert {"range": "A4:I4", "values": [["Drużyna", "Multi EUW", "Multi EUNE", "Notatki",
+                                               "Top", "Jungle", "Mid", "ADC", "Support"]]} in updates
         assert {"range": "A5:A6", "values": [["Cockpit"], ["francja"]]} in updates
 
     async def test_from_our_games_against_them(self, monkeypatch, sheet):
@@ -552,7 +599,7 @@ class TestKnownPlayers:
                                      "enemy": [{"riot_id": r, "champion": "Ahri"} for r in enemies],
                                      "enemy_bans": ["Camille"]}, label)
 
-        players, source = await scouting.known_players("cockpit")
+        players, source, _ = await scouting.known_players("cockpit")
         history = await scouting.history_against_us("Cockpit")
 
         assert players[0] == "E1#X" and set(players) == {"E1#X", "E2#X", "E3#X"}
@@ -568,8 +615,8 @@ class TestAutoScouting:
         lp_bot = bot_module.LPTrackerBot()
         channel = SimpleNamespace(send=AsyncMock())
         monkeypatch.setattr(lp_bot, "get_reminder_channel", AsyncMock(return_value=channel))
-        monkeypatch.setattr(bot_module.scouting, "known_players", AsyncMock(return_value=(["A#1"], "zakładka Przeciwnicy")))
-        monkeypatch.setattr(bot_module.scouting, "start_scouting", lambda *args: lp_bot.started.append(args))
+        monkeypatch.setattr(bot_module.scouting, "known_players", AsyncMock(return_value=(["A#1"], "zakładka Przeciwnicy", {})))
+        monkeypatch.setattr(bot_module.scouting, "start_scouting", lambda *args, **kwargs: lp_bot.started.append(args))
         lp_bot.started = []
         return lp_bot
 

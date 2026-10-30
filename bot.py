@@ -405,9 +405,9 @@ class LPTrackerBot(commands.Bot):
 
     async def scout_opponent(self, channel, opponent: str) -> None:
         """Start scouting an official's opponent when its players are known (Przeciwnicy tab, saved, or our games)."""
-        players, _ = await scouting.known_players(opponent)
+        players, _, roles = await scouting.known_players(opponent)
         if players:
-            scouting.start_scouting(channel, opponent, players)
+            scouting.start_scouting(channel, opponent, players, roles=roles)
         else:
             print(f"Scouting: no players known for {opponent}, add them to the Przeciwnicy tab")
 

@@ -7,6 +7,7 @@ Opponents' accounts come from the "Przeciwnicy" tab (multi op.gg links per team)
 Posted to Discord and written to the bot-only "Scouting" tab.
 """
 import asyncio
+import difflib
 import re
 import time
 from collections import Counter, defaultdict
@@ -31,8 +32,15 @@ from sheets import team_sheet
 SCOUTING_TAB = "Scouting"
 # Filled in by hand: one row per team (name as in the "Przeciwnik" column of "Mecze"), headers in row 4
 OPPONENTS_TAB = "Przeciwnicy"
-OPPONENTS_HEADERS = ["Drużyna", "Multi EUW", "Multi EUNE", "Notatki"]
+# Role columns are optional: a player's accounts per role, when the automatic split gets them wrong
+OPPONENTS_HEADERS = ["Drużyna", "Multi EUW", "Multi EUNE", "Notatki", "Top", "Jungle", "Mid", "ADC", "Support"]
 OPPONENTS_FIRST_ROW = 5
+OPPONENTS_INSTRUCTIONS = (
+    "Jedna drużyna na wiersz: nazwa jak w kolumnie Przeciwnik w Meczach i linki multi op.gg z EUW i EUNE "
+    "(albo Riot ID po przecinku), najlepiej w kolejności Top, Jungle, Mid, ADC, Support. /scout i scouting przed "
+    "oficjalami biorą graczy stąd i same rozdzielają konta na 5 graczy. Opcjonalnie w kolumnach Top-Support wpisz "
+    "konta danego gracza (Riot ID albo sama nazwa, po przecinku), jeśli bot rozdzieli je źle."
+)
 OPPONENTS_CACHE_SECONDS = 300
 # Flex isn't scouted; this keeps Flex games stored earlier out of the tournament ones
 RANKED_QUEUES = {420: "SoloQ", 440: "Flex"}
@@ -48,6 +56,7 @@ PLATFORM_NAMES = {"euw1": "EUW", "eun1": "EUNE"}
 SEASON_OFFSET = 2010
 IDS_PAGE = 100
 MONTH_SECONDS = 30 * 24 * 60 * 60
+DAY_MS = 24 * 60 * 60 * 1000
 # Besides the whole period, the report shows the most recent months on their own
 RECENT_MONTHS = 3
 # Periods offered by /scout as (SoloQ months, tournament months); "quick" is fast to fetch
@@ -75,6 +84,34 @@ TOURNEY_WEIGHT = 3
 # One champion with this share of a player's ranked games in the period (and enough games) is a one-trick
 ONE_TRICK_SHARE = 0.4
 ONE_TRICK_MIN_GAMES = 15
+# Splitting a team's accounts into five players: role evidence from games (tournament games
+# count TOURNEY_ROLE_WEIGHT times, as SoloQ roles are often off-role), confident from
+# ROLE_CONFIDENT_GAMES weighted games; accounts with less than ROLE_PROBE_BELOW get their last
+# ROLE_PROBE_GAMES SoloQ games fetched just to see their role
+TOURNEY_ROLE_WEIGHT = 3
+# Roles come from recent games when there are enough: SoloQ of the last ROLE_SOLOQ_DAYS and
+# tournaments of the last ROLE_TOURNEY_DAYS (all stored games otherwise)
+ROLE_SOLOQ_DAYS = 30
+ROLE_TOURNEY_DAYS = 90
+ROLE_CONFIDENT_GAMES = 10
+ROLE_PROBE_BELOW = 5
+ROLE_PROBE_GAMES = 10
+# Signals that two accounts are one player (added to the role fit); playing in the same game
+# means two people, so it outweighs everything else
+SIMILAR_NAME_BONUS = 0.6
+SAME_SERVER_PENALTY = 0.4
+SAME_GAME_PENALTY = 5.0
+SIMILAR_NAME_RATIO = 0.6
+# A server's list of five accounts in role order (Top to Support) says each account's role
+# and, with both lists in order, which EUW and EUNE accounts go together. A list is taken as
+# in order unless an account with ORDER_CHECK_GAMES tournament games plays its position's role
+# in less than ORDER_MIN_SHARE of them.
+LIST_ROLE_PRIOR = 0.15
+SAME_LIST_POSITION_BONUS = 0.3
+ORDER_CHECK_GAMES = 5
+ORDER_MIN_SHARE = 0.25
+# Search limit for the split (10 accounts take far less)
+ASSIGNMENT_NODE_LIMIT = 2_000_000
 # gol.gg writes some champions differently than Data Dragon
 CHAMPION_ALIASES = {"nunuwillump": "nunu"}
 # The three champion blocks per player in the sheet start in columns A, J and S
@@ -457,17 +494,167 @@ def server_name(platform: str) -> str:
     return PLATFORM_NAMES.get(platform, platform.upper())
 
 
-def same_player_pairs(accounts: list[dict]) -> list[tuple[dict, dict]]:
+def is_tourney_game(game: dict) -> bool:
+    return game["queue_id"] not in RANKED_QUEUES and game["queue_id"] != CLASH_QUEUE
+
+
+def role_evidence(games: list[dict], now_ms: int = None) -> Counter:
     """
-    EUW and other-server (EUNE) accounts that are probably one player: the only EUW account
-    and the only other one with the same main role. Anything less clear stays apart.
+    Weighted games per role (tournament-code games count TOURNEY_ROLE_WEIGHT times). With
+    now_ms, from SoloQ of the last ROLE_SOLOQ_DAYS and tournaments of the last
+    ROLE_TOURNEY_DAYS if that's at least ROLE_PROBE_BELOW; otherwise from all games.
     """
-    by_role = defaultdict(lambda: ([], []))
+    def weighted(selected: list[dict]) -> Counter:
+        evidence = Counter()
+        for game in selected:
+            if game["role"] and game["season"] and game["queue_id"] != CLASH_QUEUE:
+                evidence[game["role"]] += TOURNEY_ROLE_WEIGHT if is_tourney_game(game) else 1
+        return evidence
+
+    if now_ms is not None:
+        recent = weighted([
+            g for g in games
+            if g["game_start"] >= now_ms - (ROLE_TOURNEY_DAYS if is_tourney_game(g) else ROLE_SOLOQ_DAYS) * DAY_MS
+        ])
+        if sum(recent.values()) >= ROLE_PROBE_BELOW:
+            return recent
+    return weighted(games)
+
+
+def role_fit(evidence: Counter) -> dict[str, float]:
+    """How well an account fits each role: its share of games there, scaled down with few games."""
+    total = sum(evidence.values())
+    if not total:
+        return {}
+    confidence = min(1.0, total / ROLE_CONFIDENT_GAMES)
+    return {role: count / total * confidence for role, count in evidence.items()}
+
+
+def name_key(riot_id: str) -> str:
+    return re.sub(r"[\W_]+", "", riot_id.split("#")[0].lower())
+
+
+def similar_names(a: str, b: str) -> bool:
+    """"iym#0509" and "iym999#0409": one name contains the other, or they're close."""
+    a, b = name_key(a), name_key(b)
+    if not a or not b:
+        return False
+    shorter, longer = sorted((a, b), key=len)
+    return (len(shorter) >= 3 and shorter in longer) or difflib.SequenceMatcher(None, a, b).ratio() >= SIMILAR_NAME_RATIO
+
+
+def list_positions(accounts: list[dict]) -> list[int]:
+    """Each account's place among the accounts of its server (EUW or not), in the order they were given."""
+    seen = Counter()
+    positions = []
     for account in accounts:
-        role = account["summary"]["role"]
-        if role:
-            by_role[role][0 if account["platform"] == MAIN_PLATFORM else 1].append(account)
-    return [(euw[0], other[0]) for euw, other in by_role.values() if len(euw) == 1 and len(other) == 1]
+        server = account["platform"] == MAIN_PLATFORM
+        positions.append(seen[server])
+        seen[server] += 1
+    return positions
+
+
+def pair_score(a: dict, b: dict, a_games: set[str], b_games: set[str], same_position: bool) -> float:
+    """
+    How likely two accounts are one player, as a bonus (or penalty) for putting them
+    together; same_position: the same place in EUW and EUNE lists that are in role order.
+    """
+    if a_games & b_games:
+        return -SAME_GAME_PENALTY
+    score = SIMILAR_NAME_BONUS if similar_names(a["riot_id"], b["riot_id"]) else 0.0
+    if (a["platform"] == MAIN_PLATFORM) == (b["platform"] == MAIN_PLATFORM):
+        score -= SAME_SERVER_PENALTY
+    elif same_position:
+        score += SAME_LIST_POSITION_BONUS
+    return score
+
+
+def tourney_roles(games: list[dict], now_ms: int = None) -> Counter:
+    """Tournament games per role: of the last ROLE_TOURNEY_DAYS when there are enough, else all."""
+    tourney = [g for g in games if g["role"] and g["season"] and is_tourney_game(g)]
+    if now_ms is not None:
+        recent = [g for g in tourney if g["game_start"] >= now_ms - ROLE_TOURNEY_DAYS * DAY_MS]
+        if len(recent) >= ORDER_CHECK_GAMES:
+            tourney = recent
+    return Counter(g["role"] for g in tourney)
+
+
+def in_role_order(indexes: list[int], positions: list[int], games: list[list[dict]], now_ms: int = None) -> bool:
+    """
+    Whether a server's list of five accounts goes Top to Support: yes unless an account with
+    ORDER_CHECK_GAMES tournament games plays its position's role in under ORDER_MIN_SHARE of them.
+    """
+    for i in indexes:
+        roles = tourney_roles(games[i], now_ms)
+        total = sum(roles.values())
+        if total >= ORDER_CHECK_GAMES and roles[ROLES[positions[i]]] / total < ORDER_MIN_SHARE:
+            return False
+    return True
+
+
+def assign_roles(accounts: list[dict], games_by_puuid: dict, now_ms: int = None,
+                 fixed: dict[int, str] = None) -> dict[str, list[int]]:
+    """
+    Split a team's accounts into one player per role (as many players as roles, or as
+    accounts when fewer; at most ceil(accounts / 5) accounts each), as role -> account
+    indexes. fixed: accounts whose role is already known (from the sheet). Picks the split
+    with the best total of role fit (recent games) and pair_score within players, so e.g.
+    ten accounts become five players of two accounts.
+    """
+    n = len(accounts)
+    if not n:
+        return {}
+    fixed = fixed or {}
+    games = [games_by_puuid.get(a["puuid"], []) for a in accounts]
+    fits = [role_fit(role_evidence(g, now_ms)) for g in games]
+    played = [{g["match_id"] for g in account_games} for account_games in games]
+    positions = list_positions(accounts)
+    servers = [a["platform"] == MAIN_PLATFORM for a in accounts]
+    ordered = {}
+    for server in (True, False):
+        indexes = [i for i in range(n) if servers[i] == server]
+        ordered[server] = len(indexes) == len(ROLES) and in_role_order(indexes, positions, games, now_ms)
+        for i in indexes if ordered[server] else []:
+            fits[i][ROLES[positions[i]]] = fits[i].get(ROLES[positions[i]], 0) + LIST_ROLE_PRIOR
+    pairs = [
+        [pair_score(accounts[i], accounts[j], played[i], played[j],
+                    ordered[True] and ordered[False] and positions[i] == positions[j]) if i != j else 0.0
+         for j in range(n)]
+        for i in range(n)
+    ]
+
+    members = {role: [i for i, r in fixed.items() if r == role] for role in ROLES}
+    cap = max(-(-n // len(ROLES)), max(len(m) for m in members.values()))
+    order = sorted((i for i in range(n) if i not in fixed), key=lambda i: -max(fits[i].values(), default=0))
+    best_gain = [max(fits[i].values(), default=0) + max(0.0, max(pairs[i])) * (cap - 1) for i in range(n)]
+    remaining = [sum(best_gain[i] for i in order[k:]) for k in range(len(order) + 1)]
+    best = {"score": float("-inf"), "split": None}
+    nodes = 0
+
+    def search(k: int, score: float) -> None:
+        nonlocal nodes
+        nodes += 1
+        if nodes > ASSIGNMENT_NODE_LIMIT or score + remaining[k] <= best["score"]:
+            return
+        if k == len(order):
+            best["score"], best["split"] = score, {role: list(m) for role, m in members.items() if m}
+            return
+        i = order[k]
+        empty = sum(1 for m in members.values() if not m)
+        for role in sorted(ROLES, key=lambda r: -fits[i].get(r, 0)):
+            if len(members[role]) >= cap:
+                continue
+            # With at least five accounts every role needs one, so the roles still empty must not
+            # outnumber the accounts still to place
+            if n >= len(ROLES) and empty - (0 if members[role] else 1) > len(order) - k - 1:
+                continue
+            gain = fits[i].get(role, 0) + sum(pairs[i][j] for j in members[role])
+            members[role].append(i)
+            search(k + 1, score + gain)
+            members[role].pop()
+
+    search(0, 0.0)
+    return best["split"] or {role: [i] for role, i in zip(ROLES, range(n))}
 
 
 def merged_summary(accounts: list[dict], games_by_puuid: dict, now: int, months: int, pro_meta: dict,
@@ -483,30 +670,80 @@ def merged_summary(accounts: list[dict], games_by_puuid: dict, now: int, months:
     return summarize(games, now, months, pro_meta, policy, tourney_months)
 
 
-def group_accounts(looked_up: list[dict], games_by_puuid: dict, now: int, months: int, pro_meta: dict,
-                   tourney_months: int) -> list[dict]:
+async def probe_roles(accounts: list[dict], games_by_puuid: dict, now_ms: int = None) -> None:
     """
-    The report's players by role, as {"name", "accounts", "summary"}, with an EUW and an EUNE
-    account of the same role merged (same_player_pairs); failed lookups as {"riot_id", "error"} last.
+    Fetch the last ROLE_PROBE_GAMES SoloQ games of accounts with too few recent games to tell
+    their role (e.g. an EUNE account whose SoloQ isn't scouted); they're only used for the role.
+    """
+    scouted = {a["puuid"] for a in accounts}
+    probed = False
+    for account in accounts:
+        if sum(role_evidence(games_by_puuid[account["puuid"]], now_ms).values()) >= ROLE_PROBE_BELOW:
+            continue
+        try:
+            ids = await riot_api.get_match_ids(account["puuid"], queue=SOLOQ_QUEUE, count=ROLE_PROBE_GAMES)
+        except RiotAPIError as e:
+            print(f"Scouting: no recent games of {account['riot_id']}: {e}")
+            continue
+        known = {g["match_id"] for g in games_by_puuid[account["puuid"]]}
+        new = [match_id for match_id in ids if match_id not in known]
+        if new:
+            await store_scout_games(new, scouted)
+            probed = True
+    if probed:
+        # A fetched game may have other scouted accounts in it too
+        for account in accounts:
+            games_by_puuid[account["puuid"]] = await db.get_scout_games(account["puuid"])
+
+
+def fixed_role_indexes(accounts: list[dict], roles: dict[str, list[str]]) -> dict[int, str]:
+    """Accounts named in the sheet's role columns (full Riot ID or just the name), as index -> role."""
+    fixed = {}
+    for role, names in (roles or {}).items():
+        for name in names:
+            key = name.strip().lower()
+            matches = [
+                i for i, a in enumerate(accounts)
+                if a["riot_id"].lower() == key or ("#" not in key and account_name(a).lower() == key)
+            ]
+            if matches:
+                fixed[matches[0]] = role
+            else:
+                print(f"Scouting: no account '{name}' for {role}")
+    return fixed
+
+
+def group_accounts(looked_up: list[dict], games_by_puuid: dict, now: int, months: int, pro_meta: dict,
+                   tourney_months: int, roles: dict[str, list[str]] = None) -> list[dict]:
+    """
+    The report's players: the accounts split into one player per role (assign_roles, with
+    the sheet's roles fixed), as {"name", "accounts", "summary"} in role order, each account
+    with a "role_note" when it was put outside its usual role; failed lookups as
+    {"riot_id", "error"} last.
     """
     accounts = [a for a in looked_up if not a.get("error")]
-    partner = {}
-    for euw, other in same_player_pairs(accounts):
-        partner[euw["puuid"]], partner[other["puuid"]] = other, euw
-
-    players, done = [], set()
-    for account in accounts:
-        if account["puuid"] in done:
-            continue
-        group = [account] + ([partner[account["puuid"]]] if account["puuid"] in partner else [])
-        group.sort(key=lambda a: a["platform"] != MAIN_PLATFORM)
-        done.update(a["puuid"] for a in group)
-        summary = account["summary"] if len(group) == 1 else merged_summary(
-            group, games_by_puuid, now, months, pro_meta, tourney_months)
+    now_ms = now * 1000
+    fixed = fixed_role_indexes(accounts, roles)
+    players = []
+    split = assign_roles(accounts, games_by_puuid, now_ms, fixed)
+    for role, indexes in sorted(split.items(), key=lambda item: ROLES.index(item[0])):
+        group = [accounts[i] for i in indexes]
+        group.sort(key=lambda a: (a["platform"] != MAIN_PLATFORM,
+                                  -sum(role_evidence(games_by_puuid.get(a["puuid"], []), now_ms).values())))
+        for account in group:
+            evidence = role_evidence(games_by_puuid.get(account["puuid"], []), now_ms)
+            main = evidence.most_common(1)[0][0] if evidence else None
+            if accounts.index(account) in fixed:
+                account["role_note"] = "rola z arkusza" if main != role else None
+            elif not evidence:
+                account["role_note"] = "brak gier, rola z dopasowania"
+            elif main != role:
+                account["role_note"] = f"gra głównie {main}"
+            else:
+                account["role_note"] = None
+        summary = merged_summary(group, games_by_puuid, now, months, pro_meta, tourney_months)
+        summary["role"] = role
         players.append({"name": " / ".join(account_name(a) for a in group), "accounts": group, "summary": summary})
-
-    role_order = {role: i for i, role in enumerate(ROLES)}
-    players.sort(key=lambda p: role_order.get(p["summary"]["role"], len(ROLES)))
     return players + [{"riot_id": a["riot_id"], "error": a["error"]} for a in looked_up if a.get("error")]
 
 
@@ -515,6 +752,8 @@ def account_text(account: dict, merged: bool) -> str:
     text = f"{account['riot_id']} ({server_name(account['platform'])}, SoloQ: {rank_text(account['ranks'].get('solo'))}"
     if merged and account["policy"]["skipped"]:
         text += f", {account['policy']['skipped']}"
+    if account.get("role_note"):
+        text += f", {account['role_note']}"
     return text + ")"
 
 
@@ -597,11 +836,8 @@ def opponents_tab_updates(team_names: list[str]) -> list[dict]:
     """Title, instructions, headers and the given team names for a new "Przeciwnicy" tab."""
     updates = [
         {"range": "A1", "values": [["Przeciwnicy"]]},
-        {"range": "A2", "values": [[
-            "Jedna drużyna na wiersz: nazwa jak w kolumnie Przeciwnik w Meczach i linki multi op.gg z EUW i EUNE "
-            "(albo Riot ID po przecinku). /scout i scouting przed oficjalami biorą graczy stąd."
-        ]]},
-        {"range": "A4:D4", "values": [OPPONENTS_HEADERS]},
+        {"range": "A2", "values": [[OPPONENTS_INSTRUCTIONS]]},
+        {"range": f"A4:{chr(ord('A') + len(OPPONENTS_HEADERS) - 1)}4", "values": [OPPONENTS_HEADERS]},
     ]
     if team_names:
         last = OPPONENTS_FIRST_ROW + len(team_names) - 1
@@ -610,7 +846,11 @@ def opponents_tab_updates(team_names: list[str]) -> list[dict]:
 
 
 def parse_opponent_rows(rows: list[list]) -> dict[str, dict]:
-    """Teams from raw "Przeciwnicy" rows (header row first) by lowercase name: {"name", "players"}."""
+    """
+    Teams from raw "Przeciwnicy" rows (header row first) by lowercase name: {"name",
+    "players", "roles"}; roles are the optional role columns (role -> account names), and
+    full Riot IDs there count as players too.
+    """
     if not rows:
         return {}
     header = [str(cell).strip() for cell in rows[0]]
@@ -619,13 +859,23 @@ def parse_opponent_rows(rows: list[list]) -> dict[str, dict]:
         return {}
     name_column = header.index("Drużyna")
     link_columns = [header.index(name) for name in ("Multi EUW", "Multi EUNE") if name in header]
+    role_columns = {role: header.index(role) for role in ROLES if role in header}
     teams = {}
     for row in rows[1:]:
-        name = str(row[name_column]).strip() if name_column < len(row) else ""
-        links = " ".join(str(row[i]) for i in link_columns if i < len(row) and row[i])
-        players = parse_players(links)
+        def cell(i: int) -> str:
+            return str(row[i]).strip() if i < len(row) and row[i] is not None else ""
+
+        name = cell(name_column)
+        players = parse_players(" ".join(cell(i) for i in link_columns))
+        roles = {}
+        for role, column in role_columns.items():
+            names = [n.strip() for n in re.split(r"[,;\n]", cell(column)) if n.strip()]
+            if names:
+                roles[role] = names
+                known = {p.lower() for p in players}
+                players += [n for n in names if "#" in n and n.lower() not in known]
         if name and players:
-            teams[name.lower()] = {"name": name, "players": players}
+            teams[name.lower()] = {"name": name, "players": players, "roles": roles}
     return teams
 
 
@@ -667,21 +917,28 @@ async def read_opponents_tab() -> dict[str, dict]:
     return teams
 
 
-async def known_players(team_name: str) -> tuple[list[str], str]:
+async def known_players(team_name: str) -> tuple[list[str], str, dict[str, list[str]]]:
     """
-    The team's Riot IDs and where they came from: the "Przeciwnicy" tab, else saved with
-    /scout, else the most frequent opponents in our games against it. Empty when unknown.
+    The team's Riot IDs, where they came from, and the sheet's role columns: the "Przeciwnicy"
+    tab, else saved with /scout, else the most frequent opponents in our games against it.
+    Empty when unknown.
     """
     team = (await read_opponents_tab()).get(team_name.strip().lower())
     if team:
-        return team["players"], f"zakładka {OPPONENTS_TAB}"
+        return team["players"], f"zakładka {OPPONENTS_TAB}", team["roles"]
     saved = await db.get_opponent(team_name)
     if saved:
-        return saved["players"], "zapisane z /scout"
+        return saved["players"], "zapisane z /scout", {}
     history = await history_against_us(team_name)
     if history["players"]:
-        return [riot_id for riot_id, _ in history["players"].most_common(7)], f"nasze gry z nimi ({maps_count(history['games'])})"
-    return [], ""
+        return [riot_id for riot_id, _ in history["players"].most_common(7)], f"nasze gry z nimi ({maps_count(history['games'])})", {}
+    return [], "", {}
+
+
+async def sheet_roles(team_name: str) -> dict[str, list[str]]:
+    """The team's role columns in the "Przeciwnicy" tab (empty without them)."""
+    team = (await read_opponents_tab()).get(team_name.strip().lower())
+    return team["roles"] if team else {}
 
 
 async def team_names() -> list[str]:
@@ -751,7 +1008,7 @@ def summary_facts(report: dict) -> str:
 
 
 async def run_scouting(team_name: str, riot_ids: list[str], months: int = SCOUT_MONTHS, progress=None,
-                       tourney_months: int = None) -> dict:
+                       tourney_months: int = None, roles: dict[str, list[str]] = None) -> dict:
     """
     Collect the scouting report of a team from SoloQ games of the last months and tournament
     games of the last tourney_months (default: months), one scouting at a time. Games are
@@ -786,11 +1043,10 @@ async def run_scouting(team_name: str, riot_ids: list[str], months: int = SCOUT_
             await progress(len(to_fetch))
         await store_scout_games(list(to_fetch), {a["puuid"] for a in accounts})
 
-        games = {}
-        for account in accounts:
-            games[account["puuid"]] = await db.get_scout_games(account["puuid"], min(since, tourney_since) * 1000)
-            account["summary"] = summarize(games[account["puuid"]], now_ts, months, pro["champions"], account["policy"], tourney_months)
-        players = group_accounts(looked_up, games, now_ts, months, pro["champions"], tourney_months)
+        # All stored games, also older ones: they only help tell roles and who played with whom
+        games = {account["puuid"]: await db.get_scout_games(account["puuid"]) for account in accounts}
+        await probe_roles(accounts, games, now_ts * 1000)
+        players = group_accounts(looked_up, games, now_ts, months, pro["champions"], tourney_months, roles)
 
         report = {
             "team": team_name,
@@ -855,11 +1111,13 @@ def embed_with(report: dict, count: int) -> discord.Embed:
         accounts = player["accounts"]
         name = f"{s['role'] or '?'} · " + " + ".join(f"{a['riot_id']} ({server_name(a['platform'])})" for a in accounts)
         if len(accounts) == 1:
-            lines = [rank_text(accounts[0]["ranks"].get("solo"))]
+            lines = [rank_text(accounts[0]["ranks"].get("solo"))
+                     + (f" · {accounts[0]['role_note']}" if accounts[0].get("role_note") else "")]
         else:
             lines = [
                 f"{server_name(a['platform'])}: {rank_text(a['ranks'].get('solo'))}"
                 + (f" · SoloQ {a['policy']['skipped']}" if a["policy"]["skipped"] else "")
+                + (f" · {a['role_note']}" if a.get("role_note") else "")
                 for a in accounts
             ]
         if s["ranked_skipped"]:
@@ -935,7 +1193,7 @@ def build_sheet_rows(report: dict) -> tuple[list[list], dict]:
     add((0, [
         f"Wygenerowano {report['created']:%d.%m.%Y %H:%M} · SoloQ z ostatnich {report['months']} mies. "
         f"(konta spoza EUW tylko od Mastera) i osobno gry z kodów turniejowych z ostatnich {report['tourney_months']} mies. · "
-        f"{pro_note(report)} · konta EUW i EUNE z tą samą rolą liczone jako jeden gracz"
+        f"{pro_note(report)} · konta rozdzielone na 5 graczy (rola z gier, wspólne gry, nazwy, kolejność w linkach)"
     ]))
 
     add()
@@ -954,7 +1212,7 @@ def build_sheet_rows(report: dict) -> tuple[list[list], dict]:
         layout["sections"].append(add((0, ["Podsumowanie"])))
         for line in report["summary"].splitlines():
             if line.strip():
-                add((0, [line.strip()]))
+                add((0, [line.strip().replace("**", "")]))
 
     history = report["history"]
     if history["games"]:
@@ -1052,7 +1310,8 @@ def fetch_estimate(games: int) -> str:
 
 
 async def post_scouting(channel, team_name: str, riot_ids: list[str], months: int = SCOUT_MONTHS,
-                        announce_progress: bool = False, tourney_months: int = None) -> None:
+                        announce_progress: bool = False, tourney_months: int = None,
+                        roles: dict[str, list[str]] = None) -> None:
     """Run the scouting, write the Scouting tab and post the report to the channel."""
     async def progress(games: int) -> None:
         if games > 50:
@@ -1061,7 +1320,7 @@ async def post_scouting(channel, team_name: str, riot_ids: list[str], months: in
             )
 
     try:
-        report = await run_scouting(team_name, riot_ids, months, progress if announce_progress else None, tourney_months)
+        report = await run_scouting(team_name, riot_ids, months, progress if announce_progress else None, tourney_months, roles)
     except Exception as e:
         print(f"Scouting of {team_name} failed: {e}")
         await channel.send(f"❌ Scouting drużyny **{discord.utils.escape_markdown(team_name)}** nie wyszedł: {e}")
@@ -1086,9 +1345,12 @@ async def post_scouting(channel, team_name: str, riot_ids: list[str], months: in
 
 
 def start_scouting(channel, team_name: str, riot_ids: list[str], months: int = SCOUT_MONTHS,
-                   announce_progress: bool = False, tourney_months: int = None) -> asyncio.Task:
+                   announce_progress: bool = False, tourney_months: int = None,
+                   roles: dict[str, list[str]] = None) -> asyncio.Task:
     """Scout in the background (it can take a while) and post the report when done."""
-    return asyncio.create_task(post_scouting(channel, team_name, riot_ids, months, announce_progress, tourney_months))
+    return asyncio.create_task(
+        post_scouting(channel, team_name, riot_ids, months, announce_progress, tourney_months, roles)
+    )
 
 
 def is_running() -> bool:
