@@ -7,6 +7,9 @@ from gspread.utils import rowcol_to_a1
 import database as db
 from config import TIMEZONE
 from roasts import plural
+from sheet_format import (
+    GRAY, grid_range, cell_format, table_format, column_widths, row_height, frozen_rows,
+)
 from sheets import team_sheet
 from team_games import ROLES
 
@@ -32,21 +35,6 @@ NOTES = (
 )
 
 # Formatting
-HEADER_BACKGROUND = {"red": 0.20, "green": 0.27, "blue": 0.36}
-WHITE = {"red": 1, "green": 1, "blue": 1}
-GRAY = {"red": 0.4, "green": 0.4, "blue": 0.4}
-GOOD = {"red": 0.83, "green": 0.93, "blue": 0.83}
-BAD = {"red": 0.96, "green": 0.82, "blue": 0.82}
-# Patterns use "." whatever the sheet's locale; the sheet shows its own decimal separator
-NUMBER_FORMATS = {
-    "pct": {"type": "PERCENT", "pattern": "0%"},
-    "wr": {"type": "PERCENT", "pattern": "0%"},
-    "dec1": {"type": "NUMBER", "pattern": "0.0"},
-    "dec2": {"type": "NUMBER", "pattern": "0.00"},
-    "diff": {"type": "NUMBER", "pattern": "+0;-0;0"},
-}
-# Winrates colored at or beyond these (written as percentages so the sheet's locale parses them)
-GOOD_WR, BAD_WR = "60%", "40%"
 COLUMN_WIDTHS = {0: 120, 1: 70, 2: 105, 3: 105}
 DEFAULT_WIDTH = 72
 NOTES_HEIGHT = 48
@@ -173,49 +161,6 @@ def build_stats_rows(rows: list[dict], player_order: list[str], now: datetime) -
     return [row + [""] * (SHEET_COLS - len(row)) for row in grid], layout
 
 
-def grid_range(sheet_id: int, start_row: int, end_row: int, start_col: int = 0, end_col: int = SHEET_COLS) -> dict:
-    return {"sheetId": sheet_id, "startRowIndex": start_row, "endRowIndex": end_row,
-            "startColumnIndex": start_col, "endColumnIndex": end_col}
-
-
-def cell_format(cells: dict, fmt: dict) -> dict:
-    return {"repeatCell": {"range": cells, "cell": {"userEnteredFormat": fmt},
-                           "fields": "userEnteredFormat(" + ",".join(fmt) + ")"}}
-
-
-def color_rule(cells: dict, condition: str, value: str, color: dict) -> dict:
-    return {"addConditionalFormatRule": {"index": 0, "rule": {
-        "ranges": [cells],
-        "booleanRule": {"condition": {"type": condition, "values": [{"userEnteredValue": value}]},
-                        "format": {"backgroundColor": color}},
-    }}}
-
-
-def table_format(sheet_id: int, header: int, end: int, columns: list[tuple[str, str]]) -> list[dict]:
-    """Header style, number formats and colors of one table (header row index, end row index exclusive)."""
-    requests = [cell_format(grid_range(sheet_id, header, header + 1, 0, len(columns)), {
-        "backgroundColor": HEADER_BACKGROUND, "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
-        "wrapStrategy": "WRAP", "textFormat": {"bold": True, "foregroundColor": WHITE},
-    })]
-    if end <= header + 1:
-        return requests
-    for i, (_, kind) in enumerate(columns):
-        cells = grid_range(sheet_id, header + 1, end, i, i + 1)
-        if kind == "name":
-            requests.append(cell_format(cells, {"textFormat": {"bold": True}}))
-        elif kind != "text":
-            fmt = {"horizontalAlignment": "CENTER"}
-            if kind in NUMBER_FORMATS:
-                fmt["numberFormat"] = NUMBER_FORMATS[kind]
-            requests.append(cell_format(cells, fmt))
-        if kind == "diff":
-            requests += [color_rule(cells, "NUMBER_GREATER", "0", GOOD), color_rule(cells, "NUMBER_LESS", "0", BAD)]
-        elif kind == "wr":
-            requests += [color_rule(cells, "NUMBER_GREATER_THAN_EQ", GOOD_WR, GOOD),
-                         color_rule(cells, "NUMBER_LESS_THAN_EQ", BAD_WR, BAD)]
-    return requests
-
-
 def build_format_requests(sheet_id: int, layout: dict) -> list[dict]:
     """Formatting of the Statystyki tab for the layout from build_stats_rows."""
     players_header, players_end = layout["players"]
@@ -223,33 +168,19 @@ def build_format_requests(sheet_id: int, layout: dict) -> list[dict]:
     requests = [
         cell_format(grid_range(sheet_id, 0, 1, 0, 1), {"textFormat": {"bold": True, "fontSize": 14}}),
         cell_format(grid_range(sheet_id, 1, 2, 0, 1), {"textFormat": {"italic": True, "foregroundColor": GRAY}}),
-        {"mergeCells": {"range": grid_range(sheet_id, 2, 3), "mergeType": "MERGE_ALL"}},
-        cell_format(grid_range(sheet_id, 2, 3), {
+        {"mergeCells": {"range": grid_range(sheet_id, 2, 3, 0, SHEET_COLS), "mergeType": "MERGE_ALL"}},
+        cell_format(grid_range(sheet_id, 2, 3, 0, SHEET_COLS), {
             "wrapStrategy": "WRAP", "verticalAlignment": "TOP",
             "textFormat": {"italic": True, "fontSize": 9, "foregroundColor": GRAY},
         }),
-        {"updateDimensionProperties": {
-            "range": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": 2, "endIndex": 3},
-            "properties": {"pixelSize": NOTES_HEIGHT}, "fields": "pixelSize",
-        }},
+        row_height(sheet_id, 2, NOTES_HEIGHT),
         cell_format(grid_range(sheet_id, matchups_title, matchups_title + 1, 0, 1), {"textFormat": {"bold": True, "fontSize": 12}}),
-        {"updateSheetProperties": {
-            # Only rows: a frozen column can't cut through the merged notes row
-            "properties": {"sheetId": sheet_id, "gridProperties": {"frozenRowCount": FROZEN_ROWS, "frozenColumnCount": 0}},
-            "fields": "gridProperties(frozenRowCount,frozenColumnCount)",
-        }},
-        {"updateDimensionProperties": {
-            "range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": SHEET_COLS},
-            "properties": {"pixelSize": DEFAULT_WIDTH}, "fields": "pixelSize",
-        }},
+        # Only rows: a frozen column can't cut through the merged notes row
+        frozen_rows(sheet_id, FROZEN_ROWS),
+        *column_widths(sheet_id, SHEET_COLS, DEFAULT_WIDTH, COLUMN_WIDTHS),
     ]
-    for column, width in COLUMN_WIDTHS.items():
-        requests.append({"updateDimensionProperties": {
-            "range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": column, "endIndex": column + 1},
-            "properties": {"pixelSize": width}, "fields": "pixelSize",
-        }})
-    requests += table_format(sheet_id, players_header, players_end, PLAYER_COLUMNS)
-    requests += table_format(sheet_id, matchups_header, matchups_end, MATCHUP_COLUMNS)
+    requests += table_format(sheet_id, players_header, players_end, [kind for _, kind in PLAYER_COLUMNS])
+    requests += table_format(sheet_id, matchups_header, matchups_end, [kind for _, kind in MATCHUP_COLUMNS])
     return requests
 
 

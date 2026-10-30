@@ -25,6 +25,7 @@ from cogs.sheet import format_tier, APEX_TIERS, SOLOQ_QUEUE
 from config import TIMEZONE, SCOUT_MONTHS, GOOGLE_SHEET_ID
 from riot_api import riot_api, RiotAPIError
 from roasts import plural, games_count
+from sheet_format import BAND_BACKGROUND, GRAY, grid_range, cell_format, table_format, column_widths
 from sheets import team_sheet
 
 SCOUTING_TAB = "Scouting"
@@ -55,7 +56,12 @@ PERIODS = {"quick": (1, 12), "3": (3, 3), "6": (6, 6), "12": (12, 12)}
 SECONDS_PER_GAME = 1.3
 GOLGG_URL = "https://gol.gg/champion/list/season-S{season}/split-ALL/tournament-ALL/"
 PRO_META_TTL = 24 * 60 * 60
+# Pro play counts only from the newest patches; older metas don't apply
+PRO_META_PATCHES = 3
+# A pro winrate needs at least this many picks to be shown
+MIN_PRO_PICKS_FOR_WR = 5
 PRO_META_ROWS = 20
+EMPTY_PRO_META = {"patches": [], "games": 0, "champions": {}}
 # Champions per player shown in the sheet, and in the embed (fewer when the embed gets too long)
 SHEET_CHAMPIONS = 10
 EMBED_CHAMPIONS = (4, 3, 2)
@@ -71,13 +77,21 @@ ONE_TRICK_SHARE = 0.4
 ONE_TRICK_MIN_GAMES = 15
 # gol.gg writes some champions differently than Data Dragon
 CHAMPION_ALIASES = {"nunuwillump": "nunu"}
-# Columns of the three champion blocks per player in the sheet (A, J, S) and their headers
-BLOCK_COLUMNS = (0, 9, 18)
-BLOCK_HEADERS = ["Champion", "Gry", "W", "L", "WR", "KDA", "Pro prio", "Pro WR"]
+# The three champion blocks per player in the sheet start in columns A, J and S
+BLOCK_STARTS = (0, 9, 18)
+# Sheet tables' columns as (header, kind), kinds as in sheet_format; long names go last so they can overflow
+BLOCK_COLUMNS = [("Champion", "name"), ("Gry", "int"), ("W", "int"), ("L", "int"), ("WR", "wr"), ("KDA", "dec2"),
+                 ("Pro P+B", "pct"), ("Pro WR", "pct")]
+BAN_COLUMNS = [("Champion", "name"), ("SoloQ gry", "int"), ("SoloQ WR", "wr"), ("Turnieje gry", "int"),
+               ("Turnieje WR", "wr"), ("Pro P+B", "pct"), ("Pro WR", "pct"), ("Rola", "text"), ("Gracz", "text")]
+PRO_COLUMNS = [("Champion", "name"), ("Picki", "int"), ("Bany", "int"), ("P+B", "pct"), ("WR", "pct")]
 SHEET_COLS = 26
+COLUMN_WIDTHS = {start: 130 for start in BLOCK_STARTS}
+DEFAULT_WIDTH = 62
 
 SUMMARY_PROMPT = """Jesteś analitykiem draftu w uczelnianej drużynie League of Legends.
-Dostajesz dane o drużynie przeciwnika: pule championów graczy z rankedów z ostatnich miesięcy, gry turniejowe, sugerowane bany i priorytet championów w grze profesjonalnej.
+Dostajesz dane o drużynie przeciwnika: pule championów graczy z rankedów z ostatnich miesięcy, gry turniejowe, sugerowane bany i obecność championów w draftach gry profesjonalnej z ostatnich patchy.
+Gracz może mieć dwa konta (EUW i EUNE); wtedy jego gry są już zsumowane.
 Napisz po polsku 3-5 krótkich punktów do przygotowania draftu: co banować, na kim się skupić, comfort picki i one-tricki, na co uważać.
 Wyraźnie rozróżniaj gry z SoloQ i turniejowe (kody turniejowe): turniejowe lepiej pokazują, co grają w meczach drużynowych.
 Opieraj się wyłącznie na podanych danych, nie wymyślaj. Każdy punkt w osobnej linii zaczynającej się od "• ", razem najwyżej 700 znaków."""
@@ -179,58 +193,86 @@ class _ChampionTableParser(HTMLParser):
             self._cell.append(data)
 
 
-def parse_percent(text: str) -> float | None:
-    match = re.match(r"(-?\d+(?:\.\d+)?)%", text or "")
-    return float(match.group(1)) / 100 if match else None
+def parse_patches(html: str) -> list[str]:
+    """Patches in gol.gg's "Game version" filter, newest first, as its values like "16.20."."""
+    select = re.search(r"<select id='patch'.*?</select>", html, re.S)
+    return list(dict.fromkeys(re.findall(r"<option value='(\d[\d.]*)'", select.group(0)))) if select else []
 
 
-def parse_pro_meta(html: str) -> dict[str, dict]:
-    """gol.gg champion stats by champion_key: picks, bans, priority score and winrate."""
+def parse_champion_table(html: str) -> dict[str, dict]:
+    """gol.gg champion stats by champion_key: picks, bans, wins and losses."""
     parser = _ChampionTableParser()
     parser.feed(html)
     if not parser.rows:
         return {}
     header = parser.rows[0]
-    needed = ("Champion", "Picks", "Bans", "PrioScore", "Winrate")
+    needed = ("Champion", "Picks", "Bans", "Wins", "Losses")
     if any(name not in header for name in needed):
         print(f"gol.gg champion table has unexpected columns: {header}")
         return {}
     column = {name: header.index(name) for name in needed}
-
-    meta = {}
-    for row in parser.rows[1:]:
-        if len(row) < len(header):
-            continue
-        name = row[column["Champion"]]
-        meta[champion_key(name)] = {
-            "champion": name,
-            "picks": int(re.sub(r"\D", "", row[column["Picks"]]) or 0),
-            "bans": int(re.sub(r"\D", "", row[column["Bans"]]) or 0),
-            "prio": parse_percent(row[column["PrioScore"]]),
-            "wr": parse_percent(row[column["Winrate"]]),
+    return {
+        champion_key(row[column["Champion"]]): {
+            "champion": row[column["Champion"]],
+            **{name.lower(): int(re.sub(r"\D", "", row[column[name]]) or 0) for name in needed[1:]},
         }
-    return meta
+        for row in parser.rows[1:] if len(row) >= len(header)
+    }
 
 
-async def fetch_pro_meta(season: int) -> dict[str, dict]:
-    """Pro-play champion stats of a season from gol.gg, cached for a day. Empty when unavailable."""
+def combine_pro_tables(tables: list[dict]) -> tuple[dict[str, dict], int]:
+    """
+    Champion stats summed over patches, with presence (picks and bans per game) and winrate
+    (from MIN_PRO_PICKS_FOR_WR picks), and the number of games (ten picks each).
+    """
+    totals = {}
+    for table in tables:
+        for key, stats in table.items():
+            total = totals.setdefault(key, {"champion": stats["champion"], "picks": 0, "bans": 0, "wins": 0, "losses": 0})
+            for name in ("picks", "bans", "wins", "losses"):
+                total[name] += stats[name]
+    games = sum(total["picks"] for total in totals.values()) // 10
+    champions = {
+        key: {
+            "champion": t["champion"],
+            "picks": t["picks"],
+            "bans": t["bans"],
+            "presence": (t["picks"] + t["bans"]) / games if games else None,
+            "wr": t["wins"] / (t["wins"] + t["losses"]) if t["picks"] >= MIN_PRO_PICKS_FOR_WR and t["wins"] + t["losses"] else None,
+        }
+        for key, t in totals.items()
+    }
+    return champions, games
+
+
+async def fetch_pro_meta(season: int) -> dict:
+    """
+    Pro-play champion stats of the season's last PRO_META_PATCHES patches from gol.gg, cached
+    for a day: {"patches", "games", "champions" by champion_key}. gol.gg keeps the patch
+    filter in its session, so the patches are posted one by one in one session.
+    """
     major = season - SEASON_OFFSET
     cached = _pro_meta_cache.get(major)
     if cached and time.time() - cached[0] < PRO_META_TTL:
         return cached[1]
+    url = GOLGG_URL.format(season=major)
     try:
         async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=60), headers={"User-Agent": "LP-Tracker (team Discord bot)"}
+            timeout=aiohttp.ClientTimeout(total=120), headers={"User-Agent": "LP-Tracker (team Discord bot)"}
         ) as session:
-            async with session.get(GOLGG_URL.format(season=major)) as response:
-                if response.status != 200:
-                    print(f"gol.gg returned {response.status}")
-                    return cached[1] if cached else {}
-                html = await response.text()
+            async with session.get(url) as response:
+                response.raise_for_status()
+                patches = parse_patches(await response.text())[:PRO_META_PATCHES]
+            tables = []
+            for patch in patches:
+                async with session.post(url, data={"patch": patch}) as response:
+                    response.raise_for_status()
+                    tables.append(parse_champion_table(await response.text()))
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         print(f"Could not load pro meta from gol.gg: {e}")
-        return cached[1] if cached else {}
-    meta = parse_pro_meta(html)
+        return cached[1] if cached else EMPTY_PRO_META
+    champions, games = combine_pro_tables(tables)
+    meta = {"patches": [patch.rstrip(".") for patch in patches], "games": games, "champions": champions}
     _pro_meta_cache[major] = (time.time(), meta)
     return meta
 
@@ -334,7 +376,7 @@ def champion_table(games: list[dict], pro_meta: dict) -> list[dict]:
             "losses": s["games"] - s["wins"],
             "wr": s["wins"] / s["games"],
             "kda": round((s["kills"] + s["assists"]) / max(s["deaths"], 1), 2),
-            "pro_prio": pro.get("prio"),
+            "pro_presence": pro.get("presence"),
             "pro_wr": pro.get("wr"),
         })
     return sorted(table, key=lambda c: (-c["games"], -c["wins"], c["champion"]))
@@ -407,8 +449,73 @@ def rank_text(entry: dict | None) -> str:
             f"{entry.get('wins', 0)}-{entry.get('losses', 0)} ({pct(entry['wins'] / games) if games else '-'})")
 
 
-def player_name(player: dict) -> str:
-    return player["riot_id"].split("#")[0]
+def account_name(account: dict) -> str:
+    return account["riot_id"].split("#")[0]
+
+
+def server_name(platform: str) -> str:
+    return PLATFORM_NAMES.get(platform, platform.upper())
+
+
+def same_player_pairs(accounts: list[dict]) -> list[tuple[dict, dict]]:
+    """
+    EUW and other-server (EUNE) accounts that are probably one player: the only EUW account
+    and the only other one with the same main role. Anything less clear stays apart.
+    """
+    by_role = defaultdict(lambda: ([], []))
+    for account in accounts:
+        role = account["summary"]["role"]
+        if role:
+            by_role[role][0 if account["platform"] == MAIN_PLATFORM else 1].append(account)
+    return [(euw[0], other[0]) for euw, other in by_role.values() if len(euw) == 1 and len(other) == 1]
+
+
+def merged_summary(accounts: list[dict], games_by_puuid: dict, now: int, months: int, pro_meta: dict,
+                   tourney_months: int) -> dict:
+    """One summary of a player's accounts, each account's SoloQ counted by its own policy."""
+    games = [
+        game for account in accounts for game in games_by_puuid[account["puuid"]]
+        if game["queue_id"] not in RANKED_QUEUES or game["queue_id"] in account["policy"]["queues"]
+    ]
+    counted = any(account["policy"]["queues"] for account in accounts)
+    policy = {"queues": {SOLOQ_QUEUE} if counted else set(), "label": "SoloQ",
+              "skipped": None if counted else accounts[0]["policy"]["skipped"]}
+    return summarize(games, now, months, pro_meta, policy, tourney_months)
+
+
+def group_accounts(looked_up: list[dict], games_by_puuid: dict, now: int, months: int, pro_meta: dict,
+                   tourney_months: int) -> list[dict]:
+    """
+    The report's players by role, as {"name", "accounts", "summary"}, with an EUW and an EUNE
+    account of the same role merged (same_player_pairs); failed lookups as {"riot_id", "error"} last.
+    """
+    accounts = [a for a in looked_up if not a.get("error")]
+    partner = {}
+    for euw, other in same_player_pairs(accounts):
+        partner[euw["puuid"]], partner[other["puuid"]] = other, euw
+
+    players, done = [], set()
+    for account in accounts:
+        if account["puuid"] in done:
+            continue
+        group = [account] + ([partner[account["puuid"]]] if account["puuid"] in partner else [])
+        group.sort(key=lambda a: a["platform"] != MAIN_PLATFORM)
+        done.update(a["puuid"] for a in group)
+        summary = account["summary"] if len(group) == 1 else merged_summary(
+            group, games_by_puuid, now, months, pro_meta, tourney_months)
+        players.append({"name": " / ".join(account_name(a) for a in group), "accounts": group, "summary": summary})
+
+    role_order = {role: i for i, role in enumerate(ROLES)}
+    players.sort(key=lambda p: role_order.get(p["summary"]["role"], len(ROLES)))
+    return players + [{"riot_id": a["riot_id"], "error": a["error"]} for a in looked_up if a.get("error")]
+
+
+def account_text(account: dict, merged: bool) -> str:
+    """An account with its server and SoloQ rank; in a merged player also when its SoloQ isn't counted."""
+    text = f"{account['riot_id']} ({server_name(account['platform'])}, SoloQ: {rank_text(account['ranks'].get('solo'))}"
+    if merged and account["policy"]["skipped"]:
+        text += f", {account['policy']['skipped']}"
+    return text + ")"
 
 
 def ban_suggestions(players: list[dict]) -> list[dict]:
@@ -436,16 +543,15 @@ def ban_suggestions(players: list[dict]) -> list[dict]:
                 reasons.append(f"turnieje: {games_count(t['games'])}, {pct(t['wr'])} WR")
             candidates.append({
                 "champion": champion,
-                "player": player_name(player),
-                "role": player["summary"]["role"],
+                "player": player["name"],
+                "role": summary["role"],
                 "score": games * (wins + 1) / (games + 2),
                 "reason": " · ".join(reasons),
-                "ranked_label": summary["ranked_label"],
                 "ranked_games": r["games"] if r else 0,
                 "ranked_wr": r["wr"] if r else None,
                 "tourney_games": t["games"] if t else 0,
                 "tourney_wr": t["wr"] if t else None,
-                "pro_prio": (r or t)["pro_prio"],
+                "pro_presence": (r or t)["pro_presence"],
                 "pro_wr": (r or t)["pro_wr"],
             })
     suggestions, seen = [], set()
@@ -620,9 +726,9 @@ def summary_facts(report: dict) -> str:
             ranked = f"{s['ranked_label']} w ostatnich {s['months']} mies.: {pool_text(s['ranked'], 5)}"
             if s["recent_months"]:
                 ranked += f"; {s['ranked_label']} w ostatnich {s['recent_months']} mies.: {pool_text(s['recent'], 3)}"
+        accounts = "; ".join(account_text(a, len(player["accounts"]) > 1) for a in player["accounts"])
         lines.append(
-            f"{s['role'] or '?'} {player_name(player)} ({PLATFORM_NAMES.get(player['platform'], player['platform'])}, "
-            f"{rank_text(player['ranks'].get('solo'))}): {ranked}; "
+            f"{s['role'] or '?'} {player['name']} ({accounts}): {ranked}; "
             f"turnieje (kody turniejowe) w ostatnich {s['tourney_months']} mies.: {pool_text(s['tournament'], 5)}"
             + (f"; one-trick {s['one_trick']['champion']} ({pct(s['one_trick']['share'])} gier)" if s["one_trick"] else "")
         )
@@ -636,8 +742,11 @@ def summary_facts(report: dict) -> str:
             f"banowali: {', '.join(c for c, _ in history['bans'].most_common(5)) or 'brak danych'}"
         )
     if report["pro_meta"]:
-        top = sorted(report["pro_meta"].values(), key=lambda c: -(c["prio"] or 0))[:10]
-        lines.append("Najwyższy priorytet w grze pro (gol.gg): " + ", ".join(f"{c['champion']} {pct(c['prio'])}" for c in top))
+        top = sorted(report["pro_meta"].values(), key=lambda c: -(c["presence"] or 0))[:10]
+        lines.append(
+            f"Obecność w draftach pro (pick + ban, gol.gg, patche {', '.join(report['pro_patches'])}): "
+            + ", ".join(f"{c['champion']} {pct(c['presence'])}" for c in top)
+        )
     return "\n".join(lines)
 
 
@@ -653,45 +762,47 @@ async def run_scouting(team_name: str, riot_ids: list[str], months: int = SCOUT_
     async with _scout_lock:
         await champions.refresh()
         now = datetime.now(TIMEZONE)
-        year = now.year
-        since = int(now.timestamp()) - months * MONTH_SECONDS
-        tourney_since = int(now.timestamp()) - tourney_months * MONTH_SECONDS
-        pro_meta = await fetch_pro_meta(year)
+        now_ts = int(now.timestamp())
+        since = now_ts - months * MONTH_SECONDS
+        tourney_since = now_ts - tourney_months * MONTH_SECONDS
+        pro = await fetch_pro_meta(now.year)
 
-        players = [await lookup_account(riot_id) for riot_id in riot_ids]
-        accounts = [p for p in players if not p.get("error")]
-        for player in accounts:
+        looked_up = [await lookup_account(riot_id) for riot_id in riot_ids]
+        accounts = [a for a in looked_up if not a.get("error")]
+        for account in accounts:
             try:
-                player["ranks"] = ranked_entries(await riot_api.get_league_entries(player["puuid"], player["platform"]))
+                account["ranks"] = ranked_entries(await riot_api.get_league_entries(account["puuid"], account["platform"]))
             except RiotAPIError as e:
-                print(f"Scouting: no ranks for {player['riot_id']}: {e}")
-                player["ranks"] = {}
-            player["policy"] = ranked_policy(player["platform"], player["ranks"].get("solo"))
+                print(f"Scouting: no ranks for {account['riot_id']}: {e}")
+                account["ranks"] = {}
+            account["policy"] = ranked_policy(account["platform"], account["ranks"].get("solo"))
 
         to_fetch = {}
-        for player in accounts:
+        for account in accounts:
             to_fetch.update(dict.fromkeys(
-                await new_match_ids(player["puuid"], since, player["policy"]["queues"], tourney_since)
+                await new_match_ids(account["puuid"], since, account["policy"]["queues"], tourney_since)
             ))
         if progress:
             await progress(len(to_fetch))
-        await store_scout_games(list(to_fetch), {p["puuid"] for p in accounts})
+        await store_scout_games(list(to_fetch), {a["puuid"] for a in accounts})
 
-        for player in accounts:
-            games = await db.get_scout_games(player["puuid"], min(since, tourney_since) * 1000)
-            player["summary"] = summarize(games, int(now.timestamp()), months, pro_meta, player["policy"], tourney_months)
+        games = {}
+        for account in accounts:
+            games[account["puuid"]] = await db.get_scout_games(account["puuid"], min(since, tourney_since) * 1000)
+            account["summary"] = summarize(games[account["puuid"]], now_ts, months, pro["champions"], account["policy"], tourney_months)
+        players = group_accounts(looked_up, games, now_ts, months, pro["champions"], tourney_months)
 
-        role_order = {role: i for i, role in enumerate(ROLES)}
-        players.sort(key=lambda p: role_order.get((p.get("summary") or {}).get("role"), len(ROLES)))
         report = {
             "team": team_name,
-            "year": year,
+            "year": now.year,
             "months": months,
             "tourney_months": tourney_months,
-            "created": datetime.now(TIMEZONE),
+            "created": now,
             "players": players,
             "fetched": len(to_fetch),
-            "pro_meta": pro_meta,
+            "pro_meta": pro["champions"],
+            "pro_patches": pro["patches"],
+            "pro_games": pro["games"],
             "history": await history_against_us(team_name),
         }
         report["bans"] = ban_suggestions(players)
@@ -720,8 +831,13 @@ def build_embed(report: dict) -> discord.Embed:
     return embed
 
 
+def pro_note(report: dict) -> str:
+    if not report["pro_patches"]:
+        return "pro: brak danych z gol.gg"
+    return f"pro: gol.gg, patche {', '.join(report['pro_patches'])}"
+
+
 def embed_with(report: dict, count: int) -> discord.Embed:
-    year = report["year"]
     embed = discord.Embed(
         title=f"🔎 Scouting: {report['team']}"[:256],
         color=discord.Color.purple(),
@@ -733,8 +849,16 @@ def embed_with(report: dict, count: int) -> discord.Embed:
             embed.add_field(name=player["riot_id"][:256], value=f"⚠ {player['error']}", inline=False)
             continue
         s = player["summary"]
-        name = f"{s['role'] or '?'} · {player['riot_id']} · {PLATFORM_NAMES.get(player['platform'], player['platform'].upper())}"
-        lines = [rank_text(player["ranks"].get("solo"))]
+        accounts = player["accounts"]
+        name = f"{s['role'] or '?'} · " + " + ".join(f"{a['riot_id']} ({server_name(a['platform'])})" for a in accounts)
+        if len(accounts) == 1:
+            lines = [rank_text(accounts[0]["ranks"].get("solo"))]
+        else:
+            lines = [
+                f"{server_name(a['platform'])}: {rank_text(a['ranks'].get('solo'))}"
+                + (f" · SoloQ {a['policy']['skipped']}" if a["policy"]["skipped"] else "")
+                for a in accounts
+            ]
         if s["ranked_skipped"]:
             lines.append(f"**{s['ranked_label']}:** {s['ranked_skipped']}")
         else:
@@ -764,70 +888,93 @@ def embed_with(report: dict, count: int) -> discord.Embed:
             inline=False,
         )
     embed.set_footer(text=(
-        f"SoloQ z {report['months']} mies., gry turniejowe z {report['tourney_months']} mies. · "
-        f"pro: gol.gg S{year - SEASON_OFFSET}"
+        f"SoloQ z {report['months']} mies., gry turniejowe z {report['tourney_months']} mies. · {pro_note(report)}"
         + (" · pełne tabele w zakładce Scouting" if GOOGLE_SHEET_ID else "")
     ))
     return embed
 
 
+def share(value: float | None):
+    """A fraction for a percent-formatted cell, blank for None."""
+    return "" if value is None else round(value, 3)
+
+
 def champion_block_rows(table: list[dict]) -> list[list]:
     return [
-        [c["champion"], c["games"], c["wins"], c["losses"], pct(c["wr"]), c["kda"], pct(c["pro_prio"]), pct(c["pro_wr"])]
+        [c["champion"], c["games"], c["wins"], c["losses"], share(c["wr"]), c["kda"], share(c["pro_presence"]), share(c["pro_wr"])]
         for c in table[:SHEET_CHAMPIONS]
     ]
 
 
-def build_sheet_rows(report: dict) -> list[list]:
-    """All rows of the Scouting tab, each SHEET_COLS wide."""
-    year = report["year"]
+def build_sheet_rows(report: dict) -> tuple[list[list], dict]:
+    """
+    All rows of the Scouting tab (each SHEET_COLS wide) and, for the formatting, 0-based
+    indexes of its "sections", player "bands", "block_titles" and "labels" rows, and its
+    "tables" as (header row, end row, first column, column kinds).
+    """
     grid: list[list] = []
+    layout = {"sections": [], "bands": [], "block_titles": [], "labels": [], "tables": []}
 
-    def add(*cells_at: tuple[int, list]):
+    def add(*cells_at: tuple[int, list]) -> int:
         row = [""] * SHEET_COLS
         for column, cells in cells_at:
             row[column:column + len(cells)] = cells
         grid.append(row)
+        return len(grid) - 1
+
+    def add_table(columns: list[tuple[str, str]], rows: list[list]) -> None:
+        header = add((0, [name for name, _ in columns]))
+        for row in rows:
+            add((0, row))
+        layout["tables"].append((header, len(grid), 0, [kind for _, kind in columns]))
 
     add((0, [f"Scouting: {report['team']}"]))
     add((0, [
         f"Wygenerowano {report['created']:%d.%m.%Y %H:%M} · SoloQ z ostatnich {report['months']} mies. "
         f"(konta spoza EUW tylko od Mastera) i osobno gry z kodów turniejowych z ostatnich {report['tourney_months']} mies. · "
-        f"pro: gol.gg S{year - SEASON_OFFSET}, wszystkie turnieje"
+        f"{pro_note(report)} · konta EUW i EUNE z tą samą rolą liczone jako jeden gracz"
     ]))
+
     add()
-    add((0, ["Sugerowane bany"]))
-    add((0, ["Champion", "Gracz", "Rola", "Ranked", "Ranked gry", "Ranked WR", "Turnieje gry", "Turnieje WR", "Pro prio", "Pro WR"]))
-    for ban in report["bans"]:
-        add((0, [
-            ban["champion"], ban["player"], ban["role"], ban["ranked_label"], ban["ranked_games"], pct(ban["ranked_wr"]),
-            ban["tourney_games"], pct(ban["tourney_wr"]), pct(ban["pro_prio"]), pct(ban["pro_wr"]),
-        ]))
+    layout["sections"].append(add((0, ["Sugerowane bany"])))
+    if report["bans"]:
+        add_table(BAN_COLUMNS, [
+            [b["champion"], b["ranked_games"] or "", share(b["ranked_wr"]), b["tourney_games"] or "", share(b["tourney_wr"]),
+             share(b["pro_presence"]), share(b["pro_wr"]), b["role"], b["player"]]
+            for b in report["bans"]
+        ])
+    else:
+        add((0, ["Za mało gier, żeby coś zasugerować"]))
+
     if report["summary"]:
         add()
-        add((0, ["Podsumowanie"]))
+        layout["sections"].append(add((0, ["Podsumowanie"])))
         for line in report["summary"].splitlines():
             if line.strip():
                 add((0, [line.strip()]))
+
     history = report["history"]
     if history["games"]:
         add()
-        add((0, ["Przeciwko nam", f"{maps_count(history['games'])}, nasz bilans {history['wins']}-{history['games'] - history['wins']}"]))
-        add((0, ["Grali", ", ".join(f"{c} ({n})" for c, n in history["picks"].most_common())]))
-        add((0, ["Banowali", ", ".join(f"{c} ({n})" for c, n in history["bans"].most_common()) or "brak danych"]))
+        layout["sections"].append(add((0, ["Przeciwko nam"])))
+        layout["labels"] += [
+            add((0, ["Mapy", f"{maps_count(history['games'])}, nasz bilans {history['wins']}-{history['games'] - history['wins']}"])),
+            add((0, ["Grali", ", ".join(f"{c} ({n})" for c, n in history["picks"].most_common())])),
+            add((0, ["Banowali", ", ".join(f"{c} ({n})" for c, n in history["bans"].most_common()) or "brak danych"])),
+        ]
 
     for player in report["players"]:
         add()
         if player.get("error"):
-            add((0, [player["riot_id"], f"⚠ {player['error']}"]))
+            layout["bands"].append(add((0, [f"{player['riot_id']}: ⚠ {player['error']}"])))
             continue
         s = player["summary"]
-        add((0, [
-            f"{s['role'] or '?'} · {player['riot_id']}",
-            PLATFORM_NAMES.get(player["platform"], player["platform"].upper()),
-            f"SoloQ: {rank_text(player['ranks'].get('solo'))}",
-            f"One-trick: {s['one_trick']['champion']} ({pct(s['one_trick']['share'])} gier)" if s["one_trick"] else "",
-        ]))
+        merged = len(player["accounts"]) > 1
+        band = f"{s['role'] or '?'} · " + " + ".join(account_text(a, merged) for a in player["accounts"])
+        if s["one_trick"]:
+            band += f" · one-trick: {s['one_trick']['champion']} ({pct(s['one_trick']['share'])} gier)"
+        layout["bands"].append(add((0, [band])))
+
         if s["ranked_skipped"]:
             ranked_titles = [f"{s['ranked_label']}: {s['ranked_skipped']}", ""]
         else:
@@ -839,26 +986,61 @@ def build_sheet_rows(report: dict) -> list[list]:
         titles = ranked_titles + [
             f"Turnieje (kody turniejowe), ostatnie {s['tourney_months']} mies. ({games_count(s['tournament_games'])})",
         ]
+        layout["block_titles"].append(add(*[(column, [title]) for column, title in zip(BLOCK_STARTS, titles)]))
         blocks = [champion_block_rows(s["ranked"]), champion_block_rows(s["recent"]), champion_block_rows(s["tournament"])]
-        add(*[(column, [title]) for column, title in zip(BLOCK_COLUMNS, titles)])
-        add(*[(column, BLOCK_HEADERS) for column, block in zip(BLOCK_COLUMNS, blocks) if block])
+        if not any(blocks):
+            continue
+        header = add(*[(column, [name for name, _ in BLOCK_COLUMNS]) for column, block in zip(BLOCK_STARTS, blocks) if block])
         for i in range(max(len(block) for block in blocks)):
-            add(*[(column, block[i]) for column, block in zip(BLOCK_COLUMNS, blocks) if i < len(block)])
+            add(*[(column, block[i]) for column, block in zip(BLOCK_STARTS, blocks) if i < len(block)])
+        layout["tables"] += [
+            (header, header + 1 + len(block), column, [kind for _, kind in BLOCK_COLUMNS])
+            for column, block in zip(BLOCK_STARTS, blocks) if block
+        ]
 
     if report["pro_meta"]:
         add()
-        add((0, [f"Meta pro (gol.gg S{year - SEASON_OFFSET}, wszystkie turnieje): top {PRO_META_ROWS} wg priorytetu"]))
-        add((0, ["Champion", "Picki", "Bany", "Prio", "WR"]))
-        for c in sorted(report["pro_meta"].values(), key=lambda c: -(c["prio"] or 0))[:PRO_META_ROWS]:
-            add((0, [c["champion"], c["picks"], c["bans"], pct(c["prio"]), pct(c["wr"])]))
-    return grid
+        layout["sections"].append(add((0, [
+            f"Meta pro (gol.gg, patche {', '.join(report['pro_patches'])}, {report['pro_games']} gier): "
+            f"top {PRO_META_ROWS} wg obecności w draftach (pick + ban)"
+        ])))
+        add_table(PRO_COLUMNS, [
+            [c["champion"], c["picks"], c["bans"], share(c["presence"]), share(c["wr"])]
+            for c in sorted(report["pro_meta"].values(), key=lambda c: -(c["presence"] or 0))[:PRO_META_ROWS]
+        ])
+    return grid, layout
+
+
+def build_sheet_format(sheet_id: int, layout: dict) -> list[dict]:
+    """Formatting of the Scouting tab for the layout from build_sheet_rows."""
+    requests = [
+        cell_format(grid_range(sheet_id, 0, 1, 0, 1), {"textFormat": {"bold": True, "fontSize": 16}}),
+        cell_format(grid_range(sheet_id, 1, 2, 0, 1), {"textFormat": {"italic": True, "foregroundColor": GRAY}}),
+        *column_widths(sheet_id, SHEET_COLS, DEFAULT_WIDTH, COLUMN_WIDTHS),
+    ]
+    for row in layout["sections"]:
+        requests.append(cell_format(grid_range(sheet_id, row, row + 1, 0, 1), {"textFormat": {"bold": True, "fontSize": 12}}))
+    for row in layout["bands"]:
+        requests.append(cell_format(grid_range(sheet_id, row, row + 1, 0, SHEET_COLS), {
+            "backgroundColor": BAND_BACKGROUND, "textFormat": {"bold": True, "fontSize": 11},
+        }))
+    for row in layout["block_titles"]:
+        requests.append(cell_format(grid_range(sheet_id, row, row + 1, 0, SHEET_COLS), {
+            "textFormat": {"bold": True, "italic": True, "foregroundColor": GRAY},
+        }))
+    for row in layout["labels"]:
+        requests.append(cell_format(grid_range(sheet_id, row, row + 1, 0, 1), {"textFormat": {"bold": True}}))
+    for header, end, first_col, kinds in layout["tables"]:
+        requests += table_format(sheet_id, header, end, kinds, first_col)
+    return requests
 
 
 async def write_sheet(report: dict) -> None:
-    rows = build_sheet_rows(report)
+    rows, layout = build_sheet_rows(report)
     await team_sheet.replace_tab(
         SCOUTING_TAB, [{"range": f"A1:Z{len(rows)}", "values": rows}], len(rows), SHEET_COLS
     )
+    await team_sheet.format_tab(SCOUTING_TAB, lambda sheet_id: build_sheet_format(sheet_id, layout))
 
 
 def fetch_estimate(games: int) -> str:

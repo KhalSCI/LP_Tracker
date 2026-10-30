@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import gspread
 import pytest
+from aioresponses import aioresponses
 
 import bot as bot_module
 import database as db
@@ -13,8 +14,9 @@ import scouting
 from champions import champions
 from config import TIMEZONE
 from scouting import (
-    parse_players, season_of, parse_pro_meta, champion_key, summarize, ban_suggestions, recent_months,
-    build_sheet_rows, scout_rows, parse_opponent_rows, ranked_policy, SHEET_COLS, MONTH_SECONDS,
+    parse_players, season_of, parse_patches, parse_champion_table, combine_pro_tables, champion_key, summarize,
+    ban_suggestions, recent_months, build_sheet_rows, build_sheet_format, scout_rows, parse_opponent_rows,
+    ranked_policy, same_player_pairs, group_accounts, account_text, SHEET_COLS, MONTH_SECONDS,
 )
 
 YEAR = 2026
@@ -22,12 +24,15 @@ NOW = int(datetime(2026, 10, 30, 18, 0, tzinfo=TIMEZONE).timestamp())
 DAY = 24 * 60 * 60
 GOLGG_HTML = """
 <table class="region_filter"><tr><td>Season:</td></tr></table>
+<select id='patch' class='form-control' name='patch'><option value='ALL'>-- ALL --</option><option value='16.20.'>16.20</option>
+<option value='16.18.'>16.18</option><option value='16.18.'>16.18</option><option value='16.17.'>16.17</option>
+<option value='16.16.'>16.16</option></select>
 <table class='table_list playerslist tablesaw trhover'>
 <thead><tr><th>Champion</th><th>Picks</th><th>Bans</th><th>PrioScore</th><th>Wins</th><th>Losses</th><th>Winrate</th></tr></thead>
 <tbody>
-<tr><td><a href='./champion-stats/1/'>Orianna</a></td><td>1504</td><td>4508</td><td>68%</td><td>803</td><td>701</td><td>53%</td></tr>
-<tr><td><a href='./champion-stats/2/'>Nunu</a></td><td>10</td><td>17</td><td>0%</td><td>6</td><td>4</td><td>60%</td></tr>
-<tr><td><a href='./champion-stats/3/'>Kaisa</a></td><td>848</td><td>603</td><td>14%</td><td>438</td><td>410</td><td>52%</td></tr>
+<tr><td><a href='./champion-stats/1/'>Orianna</a></td><td>6</td><td>3</td><td>68%</td><td>4</td><td>2</td><td>67%</td></tr>
+<tr><td><a href='./champion-stats/2/'>Nunu</a></td><td>2</td><td>1</td><td>0%</td><td>1</td><td>1</td><td>50%</td></tr>
+<tr><td><a href='./champion-stats/3/'>Kaisa</a></td><td>12</td><td>0</td><td>14%</td><td>6</td><td>6</td><td>50%</td></tr>
 </tbody></table>
 """
 
@@ -40,6 +45,32 @@ def game(champion: str, win=True, days_ago=10, queue=420, role="Top", season=YEA
 
 def games(champion: str, wins: int, losses: int, **kwargs) -> list[dict]:
     return [game(champion, True, n=i, **kwargs) for i in range(wins)] + [game(champion, False, n=100 + i, **kwargs) for i in range(losses)]
+
+
+def account(riot_id: str = "Top#EUW", platform: str = "euw1", tier: str = None) -> dict:
+    """A looked-up account with its ranks and SoloQ policy (no summary yet)."""
+    solo = {"tier": tier, "rank": "I", "leaguePoints": 50, "wins": 10, "losses": 10} if tier else None
+    return {"riot_id": riot_id, "puuid": riot_id, "platform": platform, "ranks": {"solo": solo} if solo else {},
+            "policy": ranked_policy(platform, solo)}
+
+
+def player(summary: dict, *accounts: dict) -> dict:
+    """A report player: one account (Top#EUW by default) or several merged."""
+    accounts = list(accounts) or [account()]
+    return {"name": " / ".join(a["riot_id"].split("#")[0] for a in accounts), "accounts": accounts, "summary": summary}
+
+
+def empty_history() -> dict:
+    return {"games": 0, "wins": 0, "players": Counter(), "picks": Counter(), "bans": Counter()}
+
+
+def report_with(players: list[dict], **fields) -> dict:
+    report = {"team": "AGH", "year": YEAR, "months": 6, "tourney_months": 6,
+              "created": datetime(2026, 10, 30, 16, 0, tzinfo=TIMEZONE), "players": players,
+              "bans": ban_suggestions(players), "summary": None, "pro_meta": {}, "pro_patches": ["16.20", "16.18", "16.17"],
+              "pro_games": 1000, "history": empty_history()}
+    report.update(fields)
+    return report
 
 
 class TestParsePlayers:
@@ -64,17 +95,50 @@ class TestParsePlayers:
 
 
 class TestProMeta:
-    """Test cases for the gol.gg parser."""
+    """Test cases for the gol.gg pro meta of the last patches."""
 
-    def test_parse(self):
-        meta = parse_pro_meta(GOLGG_HTML)
+    def test_patches(self):
+        assert parse_patches(GOLGG_HTML) == ["16.20.", "16.18.", "16.17.", "16.16."]
+        assert parse_patches("<html></html>") == []
 
-        assert meta["orianna"] == {"champion": "Orianna", "picks": 1504, "bans": 4508, "prio": 0.68, "wr": 0.53}
-        assert meta[champion_key("Nunu & Willump")]["picks"] == 10
-        assert meta[champion_key("Kai'Sa")]["prio"] == 0.14
+    def test_table(self):
+        table = parse_champion_table(GOLGG_HTML)
 
-    def test_unexpected_page(self):
-        assert parse_pro_meta("<html>Cloudflare</html>") == {}
+        assert table["orianna"] == {"champion": "Orianna", "picks": 6, "bans": 3, "wins": 4, "losses": 2}
+        assert table[champion_key("Nunu & Willump")]["picks"] == 2
+        assert table[champion_key("Kai'Sa")]["wins"] == 6
+        assert parse_champion_table("<html>Cloudflare</html>") == {}
+
+    def test_combined_patches(self):
+        table = parse_champion_table(GOLGG_HTML)
+
+        champions, games = combine_pro_tables([table, table])
+
+        assert games == 4  # 40 picks, ten per game
+        assert champions["orianna"]["picks"] == 12 and champions["orianna"]["presence"] == (12 + 6) / 4
+        assert champions["orianna"]["wr"] == 8 / 12
+        assert champions["nunu"]["wr"] is None  # 4 picks, too few for a winrate
+
+    async def test_fetch_last_three_patches(self, monkeypatch):
+        monkeypatch.setattr(scouting, "_pro_meta_cache", {})
+        url = scouting.GOLGG_URL.format(season=16)
+        with aioresponses() as mocked:
+            mocked.get(url, body=GOLGG_HTML)
+            for _ in range(3):
+                mocked.post(url, body=GOLGG_HTML)
+
+            meta = await scouting.fetch_pro_meta(2026)
+
+            posts = [call.kwargs["data"] for (method, _), calls in mocked.requests.items() if method == "POST" for call in calls]
+        assert meta["patches"] == ["16.20", "16.18", "16.17"] and meta["games"] == 6
+        assert posts == [{"patch": "16.20."}, {"patch": "16.18."}, {"patch": "16.17."}]
+        assert await scouting.fetch_pro_meta(2026) is meta  # cached
+
+    async def test_unavailable(self, monkeypatch):
+        monkeypatch.setattr(scouting, "_pro_meta_cache", {})
+        with aioresponses() as mocked:
+            mocked.get(scouting.GOLGG_URL.format(season=16), status=503)
+            assert await scouting.fetch_pro_meta(2026) == scouting.EMPTY_PRO_META
 
     def test_season(self):
         assert season_of("16.21.712.4512") == 2026
@@ -93,12 +157,12 @@ class TestSummarize:
         history.append(game("Camille", win=None, n=999))  # remake
         history.append(game("Teemo", season=None, n=998))  # not on Summoner's Rift
 
-        s = summarize(history, NOW, 6, {"camille": {"prio": 0.2, "wr": 0.5}})
+        s = summarize(history, NOW, 6, {"camille": {"presence": 0.2, "wr": 0.5}})
 
         assert [(c["champion"], c["games"], c["wins"]) for c in s["ranked"]] == [("Camille", 7, 6), ("Jax", 3, 1)]
         assert [c["champion"] for c in s["recent"]] == ["Camille"]
         assert [c["champion"] for c in s["tournament"]] == ["Gnar"]
-        assert s["ranked"][0]["pro_prio"] == 0.2 and s["ranked"][0]["kda"] == 5.0
+        assert s["ranked"][0]["pro_presence"] == 0.2 and s["ranked"][0]["kda"] == 5.0
         assert (s["months"], s["recent_months"], s["ranked_games"], s["recent_games"]) == (6, 3, 10, 7)
         assert s["role"] == "Top" and s["one_trick"] is None
 
@@ -142,9 +206,9 @@ class TestSummarize:
         assert s["one_trick"]["champion"] == "Camille"
 
     def test_ban_suggestions(self):
-        top = {"riot_id": "Top#EUW", "summary": summarize(games("Camille", 8, 2) + games("Jax", 1, 3), NOW, 6, {})}
-        mid = {"riot_id": "Mid#EUW", "summary": summarize(
-            games("Ahri", 5, 5, role="Mid") + games("Azir", 2, 1, queue=3130, role="Mid"), NOW, 6, {})}
+        top = player(summarize(games("Camille", 8, 2) + games("Jax", 1, 3), NOW, 6, {}))
+        mid = player(summarize(games("Ahri", 5, 5, role="Mid") + games("Azir", 2, 1, queue=3130, role="Mid"), NOW, 6, {}),
+                     account("Mid#EUW"))
         error = {"riot_id": "X#1", "error": "Nie znaleziono konta"}
 
         bans = ban_suggestions([top, mid, error])
@@ -155,60 +219,143 @@ class TestSummarize:
         assert (bans[1]["ranked_games"], bans[1]["tourney_games"], bans[1]["tourney_wr"]) == (0, 3, 2 / 3)
 
 
-def empty_history() -> dict:
-    return {"games": 0, "wins": 0, "players": Counter(), "picks": Counter(), "bans": Counter()}
+class TestMergingAccounts:
+    """Test cases for treating an EUW and an EUNE account of one role as one player."""
+
+    def with_role(self, acc: dict, role: str) -> dict:
+        acc["summary"] = {"role": role}
+        return acc
+
+    def test_pairs(self):
+        jungle_euw = self.with_role(account("Sredni#pit"), "Jungle")
+        jungle_eune = self.with_role(account("Lumino#INT", "eun1", "DIAMOND"), "Jungle")
+        mid_euw = self.with_role(account("Maly#pit"), "Mid")
+        mids_eune = [self.with_role(account(f"Mid{i}#EUNE", "eun1"), "Mid") for i in range(2)]
+        top_euw = self.with_role(account("Kurczak#small"), "Top")
+        unknown = self.with_role(account("New#EUNE", "eun1"), "")
+
+        pairs = same_player_pairs([jungle_euw, mid_euw, *mids_eune, jungle_eune, top_euw, unknown])
+
+        assert pairs == [(jungle_euw, jungle_eune)]
+
+    def test_merged_player(self):
+        euw, eune = account("Sredni#pit"), account("Lumino#INT", "eun1", "DIAMOND")
+        played = {
+            euw["puuid"]: games("Lee Sin", 5, 1, role="Jungle", puuid=euw["puuid"])
+            + games("Xin Zhao", 2, 0, queue=3130, role="Jungle", puuid=euw["puuid"]),
+            # EUNE below Master: its SoloQ doesn't count, its tournament games do
+            eune["puuid"]: games("Graves", 10, 0, role="Jungle", puuid=eune["puuid"])
+            + games("Xin Zhao", 1, 1, queue=3130, role="Jungle", puuid=eune["puuid"], days_ago=40),
+        }
+        for acc in (euw, eune):
+            acc["summary"] = summarize(played[acc["puuid"]], NOW, 6, {}, acc["policy"])
+        error = {"riot_id": "X#1", "error": "Nie znaleziono konta"}
+
+        players = group_accounts([eune, error, euw], played, NOW, 6, {}, 6)
+
+        merged = players[0]
+        assert merged["name"] == "Sredni / Lumino" and [a["riot_id"] for a in merged["accounts"]] == ["Sredni#pit", "Lumino#INT"]
+        assert [(c["champion"], c["games"]) for c in merged["summary"]["ranked"]] == [("Lee Sin", 6)]
+        assert [(c["champion"], c["games"], c["wins"]) for c in merged["summary"]["tournament"]] == [("Xin Zhao", 4, 3)]
+        assert players[1] == error and len(players) == 2
+
+    def test_eune_master_soloq_counts_when_merged(self):
+        euw, eune = account("A#EUW"), account("B#EUNE", "eun1", "MASTER")
+        played = {euw["puuid"]: games("Ahri", 2, 0, role="Mid", puuid="A#EUW"),
+                  eune["puuid"]: games("Syndra", 3, 0, role="Mid", puuid="B#EUNE")}
+        for acc in (euw, eune):
+            acc["summary"] = summarize(played[acc["puuid"]], NOW, 6, {}, acc["policy"])
+
+        [merged] = group_accounts([euw, eune], played, NOW, 6, {}, 6)
+
+        assert [c["champion"] for c in merged["summary"]["ranked"]] == ["Syndra", "Ahri"]
+
+    def test_account_text(self):
+        eune = account("Lumino#INT", "eun1", "DIAMOND")
+        assert account_text(eune, merged=False) == "Lumino#INT (EUNE, SoloQ: Diamond I 50 LP, 10-10 (50%))"
+        assert account_text(eune, merged=True).endswith(", nie liczę, konto EUNE poniżej Mastera)")
 
 
 class TestSheetRows:
-    """Test cases for build_sheet_rows."""
+    """Test cases for build_sheet_rows and the tab's formatting."""
 
     def test_layout(self):
-        player = {"riot_id": "Top#EUW", "platform": "eun1", "ranks": {},
-                  "summary": summarize(games("Camille", 8, 2) + games("Gnar", 1, 0, queue=3130), NOW, 6, {})}
-        report = {"team": "AGH", "year": YEAR, "months": 6, "tourney_months": 6, "created": datetime(2026, 10, 30, 16, 0, tzinfo=TIMEZONE),
-                  "players": [player, {"riot_id": "X#1", "error": "Nie znaleziono konta"}],
-                  "bans": ban_suggestions([player]), "summary": "• banujcie Camille", "pro_meta": {},
-                  "history": empty_history()}
+        top = player(summarize(games("Camille", 8, 2) + games("Gnar", 1, 0, queue=3130), NOW, 6, {}))
+        report = report_with([top, {"riot_id": "X#1", "error": "Nie znaleziono konta"}], summary="• banujcie Camille")
 
-        rows = build_sheet_rows(report)
+        rows, layout = build_sheet_rows(report)
 
         assert all(len(row) == SHEET_COLS for row in rows)
-        assert rows[0][0] == "Scouting: AGH" and "z ostatnich 6 mies." in rows[1][0]
-        assert ["Camille", "Top", "Top", "SoloQ", 10, "80%", 0, "", "", ""] == rows[5][:10]
+        assert rows[0][0] == "Scouting: AGH" and "patche 16.20, 16.18, 16.17" in rows[1][0]
+        assert rows[4][:9] == ["Champion", "SoloQ gry", "SoloQ WR", "Turnieje gry", "Turnieje WR", "Pro P+B", "Pro WR", "Rola", "Gracz"]
+        assert rows[5][:9] == ["Camille", 10, 0.8, "", "", "", "", "Top", "Top"]
+        band = next(row for row in rows if row[0].startswith("Top · "))
+        assert band[0] == "Top · Top#EUW (EUW, SoloQ: Unranked)"
         titles = next(row for row in rows if row[0].startswith("SoloQ, ostatnie"))
         assert [titles[0], titles[9], titles[18]] == [
             "SoloQ, ostatnie 6 mies. (10 gier)", "SoloQ, ostatnie 3 mies. (10 gier)",
             "Turnieje (kody turniejowe), ostatnie 6 mies. (1 gra)"]
         header = next(i for i, row in enumerate(rows) if row[0] == "Champion" and row[9] == "Champion")
-        assert rows[header + 1][:6] == ["Camille", 10, 8, 2, "80%", 5.0]
+        assert rows[header + 1][:8] == ["Camille", 10, 8, 2, 0.8, 5.0, "", ""]
         assert rows[header + 1][18:20] == ["Gnar", 1]
-        assert ["X#1", "⚠ Nie znaleziono konta"] == rows[-1][:2]
+        assert rows[-1][0] == "X#1: ⚠ Nie znaleziono konta"
+        assert 3 in layout["sections"] and rows.index(band) in layout["bands"]
+        assert (4, 6, 0) in [t[:3] for t in layout["tables"]]
+        assert [t[2] for t in layout["tables"] if t[0] == header] == [0, 9, 18]
+
+    def test_merged_player_band(self):
+        euw, eune = account("Sredni#pit", tier="MASTER"), account("Lumino#INT", "eun1", "DIAMOND")
+        report = report_with([player(summarize(games("Lee Sin", 3, 1, role="Jungle"), NOW, 6, {}), euw, eune)])
+
+        rows, _ = build_sheet_rows(report)
+        embed = scouting.build_embed(report)
+
+        band = next(row for row in rows if row[0].startswith("Jungle · "))[0]
+        assert band == ("Jungle · Sredni#pit (EUW, SoloQ: Master 50 LP, 10-10 (50%)) + "
+                        "Lumino#INT (EUNE, SoloQ: Diamond I 50 LP, 10-10 (50%), nie liczę, konto EUNE poniżej Mastera)")
+        assert embed.fields[0].name == "Jungle · Sredni#pit (EUW) + Lumino#INT (EUNE)"
+        assert "EUNE: Diamond I 50 LP, 10-10 (50%) · SoloQ nie liczę, konto EUNE poniżej Mastera" in embed.fields[0].value
+
+    def test_pro_meta_block(self):
+        meta = {"orianna": {"champion": "Orianna", "picks": 20, "bans": 30, "presence": 0.5, "wr": 0.55},
+                "ahri": {"champion": "Ahri", "picks": 10, "bans": 5, "presence": 0.15, "wr": None}}
+        rows, layout = build_sheet_rows(report_with([], pro_meta=meta))
+
+        title = next(i for i, row in enumerate(rows) if row[0].startswith("Meta pro"))
+        assert rows[title][0].startswith("Meta pro (gol.gg, patche 16.20, 16.18, 16.17, 1000 gier)")
+        assert rows[title + 2][:5] == ["Orianna", 20, 30, 0.5, 0.55] and rows[title + 3][:5] == ["Ahri", 10, 5, 0.15, ""]
+        assert title in layout["sections"]
+
+    def test_format_requests(self):
+        layout = {"sections": [3], "bands": [10], "block_titles": [11], "labels": [], "tables": [(4, 7, 0, ["name", "wr"]), (12, 15, 9, ["name", "wr"])]}
+
+        requests = build_sheet_format(5, layout)
+
+        bands = [r["repeatCell"] for r in requests if "repeatCell" in r and "backgroundColor" in r["repeatCell"]["cell"]["userEnteredFormat"]
+                 and r["repeatCell"]["range"]["startRowIndex"] == 10]
+        assert bands and bands[0]["range"]["endColumnIndex"] == SHEET_COLS
+        rules = [r["addConditionalFormatRule"]["rule"]["ranges"][0] for r in requests if "addConditionalFormatRule" in r]
+        assert {(r["startRowIndex"], r["startColumnIndex"]) for r in rules} == {(5, 1), (13, 10)}
 
     def test_quick_layout(self):
-        player = {"riot_id": "Top#EUW", "platform": "euw1", "ranks": {},
-                  "summary": summarize(games("Camille", 3, 1) + games("Gnar", 1, 0, queue=3130, days_ago=200), NOW, 1, {},
-                                       tourney_months=12)}
-        report = {"team": "AGH", "year": YEAR, "months": 1, "tourney_months": 12,
-                  "created": datetime(2026, 10, 30, 16, 0, tzinfo=TIMEZONE), "players": [player], "bans": [],
-                  "summary": None, "pro_meta": {}, "history": empty_history()}
+        top = player(summarize(games("Camille", 3, 1) + games("Gnar", 1, 0, queue=3130, days_ago=200), NOW, 1, {},
+                               tourney_months=12))
+        report = report_with([top], months=1, tourney_months=12)
 
-        titles = next(row for row in build_sheet_rows(report) if row[0].startswith("SoloQ, ostatnie"))
+        titles = next(row for row in build_sheet_rows(report)[0] if row[0].startswith("SoloQ, ostatnie"))
         embed = scouting.build_embed(report)
 
         assert [titles[0], titles[9], titles[18]] == [
             "SoloQ, ostatnie 1 mies. (4 gry)", "", "Turnieje (kody turniejowe), ostatnie 12 mies. (1 gra)"]
         assert "**SoloQ, 1 mies.:** Camille 4 (75%)" in embed.fields[0].value
         assert "**Turnieje, 12 mies.:** Gnar 1 (100%)" in embed.fields[0].value
-        assert embed.footer.text.startswith("SoloQ z 1 mies., gry turniejowe z 12 mies.")
+        assert embed.footer.text.startswith("SoloQ z 1 mies., gry turniejowe z 12 mies. · pro: gol.gg, patche 16.20")
 
     def test_skipped_soloq(self):
-        policy = ranked_policy("eun1", None)
-        player = {"riot_id": "Smurf#EUNE", "platform": "eun1", "ranks": {},
-                  "summary": summarize(games("Camille", 8, 2), NOW, 6, {}, policy)}
-        report = {"team": "AGH", "year": YEAR, "months": 6, "tourney_months": 6, "created": datetime(2026, 10, 30, 16, 0, tzinfo=TIMEZONE),
-                  "players": [player], "bans": [], "summary": None, "pro_meta": {}, "history": empty_history()}
+        smurf = account("Smurf#EUNE", "eun1")
+        report = report_with([player(summarize(games("Camille", 8, 2), NOW, 6, {}, smurf["policy"]), smurf)])
 
-        titles = next(row for row in build_sheet_rows(report) if row[18].startswith("Turnieje"))
+        titles = next(row for row in build_sheet_rows(report)[0] if row[18].startswith("Turnieje"))
         embed = scouting.build_embed(report)
 
         assert titles[0] == "SoloQ: nie liczę, konto EUNE poniżej Mastera" and titles[9] == ""
@@ -224,17 +371,15 @@ class TestEmbed:
         history = [g for i, c in enumerate(champs) for g in games(c, 5 + i, 3)]
         history += [g for c in champs for g in games(c, 2, 2, days_ago=150)]
         history += [g for c in champs for g in games(c, 1, 1, queue=3130)]
-        players = [{"riot_id": f"Very Long Player Name {i}#EUNE", "platform": "eun1", "ranks": {},
-                    "summary": summarize(history, NOW, 6, {})} for i in range(accounts)]
-        return {"team": "AGH", "year": YEAR, "months": 6, "tourney_months": 6, "created": datetime(2026, 10, 30, 16, 0, tzinfo=TIMEZONE),
-                "players": players, "bans": ban_suggestions(players), "summary": summary, "pro_meta": {},
-                "history": empty_history()}
+        players = [player(summarize(history, NOW, 6, {}), account(f"Very Long Player Name {i}#EUNE", "eun1", "MASTER"))
+                   for i in range(accounts)]
+        return report_with(players, summary=summary)
 
     def test_five_accounts_get_four_champions(self):
         embed = scouting.build_embed(self.report(5))
-        assert embed.fields[0].value.count("(") == 4 * 3
-        assert "**SoloQ, 6 mies.:**" in embed.fields[0].value and "**SoloQ, 3 mies.:**" in embed.fields[0].value
-        assert "**Turnieje, 6 mies.:**" in embed.fields[0].value
+        value = embed.fields[0].value
+        assert value.split("\n", 1)[1].count("(") == 4 * 3
+        assert "**SoloQ, 6 mies.:**" in value and "**SoloQ, 3 mies.:**" in value and "**Turnieje, 6 mies.:**" in value
 
     def test_ten_accounts_fit(self):
         embed = scouting.build_embed(self.report(10, summary="• " + "banujcie Camille " * 200))
@@ -325,7 +470,7 @@ class TestFetching:
         monkeypatch.setattr(scouting, "lookup_account", AsyncMock(side_effect=lambda r: {
             "riot_id": r, "puuid": r.split("#")[0], "platform": "euw1"}))
         monkeypatch.setattr(scouting.riot_api, "get_league_entries", AsyncMock(return_value=[]))
-        monkeypatch.setattr(scouting, "fetch_pro_meta", AsyncMock(return_value={}))
+        monkeypatch.setattr(scouting, "fetch_pro_meta", AsyncMock(return_value=scouting.EMPTY_PRO_META))
         monkeypatch.setattr(scouting, "GOOGLE_SHEET_ID", "")
         monkeypatch.setattr(scouting.llm, "enabled", lambda: False)
         progress = AsyncMock()
