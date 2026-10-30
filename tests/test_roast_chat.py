@@ -10,15 +10,19 @@ import pytest
 import bot as bot_module
 import cogs.roasts as roasts_cog
 import database as db
+import player_profiles
 import roast_chat
 from config import TIMEZONE
-from roast_chat import build_game_card, build_messages, player_knowledge, HISTORY_MESSAGES
+from roast_chat import (
+    build_game_card, build_messages, player_knowledge, author_profiles, standouts, HISTORY_MESSAGES,
+)
 
 PUUID = "test-puuid"
 MATCH_ID = "EUW1_123"
 START = datetime(2026, 10, 30, 21, 0, tzinfo=TIMEZONE)
 ROLES = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"]
-ROSTER = [{"nick": "khal", "riot_id": "OpenYourMind#MAGIK", "role": "ADC", "status": "Main"}]
+ROSTER = [{"nick": "khal", "riot_id": "OpenYourMind#MAGIK", "role": "ADC", "status": "Main"},
+          {"nick": "kizi", "riot_id": "kizi4880#EUW", "role": "Top", "status": "Main"}]
 OWNER_ID = 42
 
 
@@ -63,6 +67,10 @@ def timeline_payload() -> dict:
     ]}}
 
 
+def write_profiles(text: str) -> None:
+    player_profiles.PROFILES_PATH.write_text(text, encoding="utf-8")
+
+
 @pytest.fixture(autouse=True)
 def setup_test_db(monkeypatch, tmp_path):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test_lp_tracker.db")
@@ -76,6 +84,10 @@ class TestGameCard:
         card = build_game_card(match_payload(), timeline_payload(), PUUID, "khal")
 
         assert card.splitlines()[0] == "Gra: SoloQ, 30.10.2026 21:00, przegrana khal, 30 min, patch 16.21"
+        assert card.splitlines()[1] == ("Co się wyróżnia: najwięcej zgonów w swojej drużynie (6); "
+                                        "najwięcej obrażeń w całej grze; +1.7 CS/min względem rywala z linii")
+        # Wards are only for jungle and support
+        assert "wizja" not in card and "control" not in card
         assert ("khal: Ashe (ADC), KDA 2/6/3, CS 200 (6.7/min), gold 10.5k, obrażenia 15.0k (27% drużyny), "
                 "KP 50%") in card
         assert "solo kille 1" in card
@@ -97,6 +109,41 @@ class TestGameCard:
     def test_player_not_in_the_game(self):
         with pytest.raises(ValueError):
             build_game_card(match_payload(), None, "someone-else", "khal")
+
+    def test_vision_for_jungle_and_support(self):
+        card = build_game_card(match_payload(), None, "p2", "kuba")
+
+        assert "kuba: Garen (Jungle), KDA 2/2/2" in card
+        assert "wizja 0.50/min (wardy 8, zniszczone 1, control wardy 1)" in card
+
+
+def lane_player(position="TOP", win=False, **extra) -> dict:
+    return participant(1, 100, position, "Aatrox", 266, win=win, **extra)
+
+
+class TestStandouts:
+    """Test cases for standouts (the hooks in the game card)."""
+
+    def test_lost_after_winning_the_lane(self):
+        me = lane_player(challenges={"turretPlatesTaken": 1})
+        opponent = participant(6, 200, "TOP", "Jax", 24, challenges={"turretPlatesTaken": 6})
+        fed = participant(7, 200, "JUNGLE", "Viego", 234, kills=12, deaths=3)
+        allies = [me] + [participant(i, 100, "MIDDLE", "Ahri", 103, kills=3) for i in (2, 3, 4)]
+        facts = standouts(me, opponent, allies, [opponent, fed], {15: {"gold": 1200, "cs": 5, "xp": 300}}, 4, 30)
+
+        assert "wygrał linię (+1200 golda na 15. min), a przegrał grę" in facts
+        assert "4 zgony przed 14. minutą" in facts
+        assert "rywal z linii zebrał 6 płytek wież, on 1" in facts
+        assert "najbardziej nakarmiony przeciwnik: Viego 12/3/2" in facts
+
+    def test_carried_win(self):
+        me = lane_player(win=True, kills=1, assists=1, totalDamageDealtToChampions=5000)
+        carry = participant(2, 100, "MIDDLE", "Ahri", 103, win=True, kills=15, totalDamageDealtToChampions=40000)
+        support = participant(3, 100, "UTILITY", "Bard", 432, win=True, kills=0, totalDamageDealtToChampions=3000)
+        facts = standouts(me, None, [me, carry, support], [], {}, None, 20)
+
+        assert facts == ["najmniej obrażeń w drużynie, nie licząc supporta", "tylko 12% KP",
+                         "grę wyniósł Ahri (15/2/2, 83% obrażeń drużyny)", "gra skończona w 20 min"]
 
 
 def chat_message(role: str, content: str, author_id: int = None, author: str = None) -> dict:
@@ -175,7 +222,7 @@ class TestPlayerKnowledge:
         await db.save_team_game_stats("T3", [team_stat("T3", True, ours=False, player="enemy", riot_id="E#1")])
         await db.mark_roasted("EUW1_0", PUUID, "int")
 
-        text = await player_knowledge(player, "khal", "ADC", START + timedelta(hours=1))
+        text = await player_knowledge(player, "khal", "ADC", START + timedelta(hours=1), "EUW1_0")
 
         assert "Gracz: khal, rola w drużynie: ADC, ranga SoloQ: Emerald II 45 LP, sezon 30-25" in text
         assert "SoloQ z 30 dni: 3 gry, 1-2 (33% WR), teraz 2 porażki z rzędu" in text
@@ -185,7 +232,30 @@ class TestPlayerKnowledge:
         assert "GD@15 +200" in text
         assert "championy: Jinx 2" in text
         assert "Komentarze bota po jego grach z 7 dni: int ×1" in text
+        assert "Ashe z tej gry: 2 gry w SoloQ z 30 dni, 0% WR" in text
+        # Vision averages only from jungle and support games, and khal plays ADC
+        assert "wizja" not in text
         assert text.endswith("Teraz jest 30.10.2026 22:00")
+
+    async def test_only_game_on_a_champion_and_support_vision(self):
+        await db.init_db()
+        player = await add_player()
+        await db.save_matches([soloq_row(0, False), soloq_row(2, True, "Jinx")])
+        await db.save_team_game_stats("T1", [team_stat("T1", True, role="Support")])
+
+        text = await player_knowledge(player, "khal", "ADC", START + timedelta(hours=1), "EUW1_2")
+
+        assert "Jinx z tej gry to jego jedyna gra tym championem w SoloQ z 30 dni" in text
+        assert "wizja/min (jungle i support) 1.00" in text
+
+    async def test_team_description(self):
+        await db.init_db()
+        player = await add_player()
+        write_profiles("# Profile\n\n## Khal\nADC i kapitan,\nlubi się wywrócić.\n\n## kizi\nTop.\n")
+
+        text = await player_knowledge(player, "khal", "ADC", START)
+
+        assert text.splitlines()[1] == "Opis od drużyny: ADC i kapitan, lubi się wywrócić."
 
     async def test_unranked_without_games(self):
         await db.init_db()
@@ -196,6 +266,44 @@ class TestPlayerKnowledge:
         assert "ranga SoloQ: bez rangi" in text
         assert "SoloQ z 30 dni: brak gier w bazie" in text
         assert "Gry drużynowe" not in text
+
+
+async def add_kizi() -> None:
+    lb_id = await db.create_leaderboard(1, "inna")
+    player_id = await db.add_player(lb_id, "kizi4880#EUW", "kizi-puuid", "kizi")
+    await db.update_player_rank(player_id, "MASTER", "I", 124, 100, 90)
+    await db.save_matches([dict(soloq_row(i, False, "Yone"), puuid="kizi-puuid") for i in range(3)])
+
+
+class TestAuthorProfiles:
+    """Test cases for author_profiles."""
+
+    async def test_roster_players_other_than_the_games_player(self):
+        await db.init_db()
+        await add_player()
+        await add_kizi()
+
+        text = await author_profiles({"Kizi", "khal", "random"}, ROSTER, "OpenYourMind#MAGIK", START + timedelta(hours=1))
+
+        assert text == ("kizi: Top, Master 124 LP, sezon 100-90, SoloQ z 30 dni: 3 gry, 0-3 (0% WR), "
+                        "teraz 3 porażki z rzędu, pula: Yone 3 gry 0% WR")
+
+    async def test_description_without_a_tracked_account(self):
+        await db.init_db()
+        write_profiles("## kizi\nLuźny dzieciak, Akali i Gwen.\n")
+
+        text = await author_profiles({"kizi"}, ROSTER, "OpenYourMind#MAGIK", START)
+
+        assert text == "kizi: Top, opis od drużyny: Luźny dzieciak, Akali i Gwen."
+
+    async def test_nobody_from_the_roster(self):
+        await db.init_db()
+        assert await author_profiles({"random"}, ROSTER, "OpenYourMind#MAGIK", START) is None
+
+    def test_profiles_reach_the_model(self):
+        messages = build_messages("KARTA", "WIEDZA", [chat_message("user", "xd", 7, "kizi")], OWNER_ID, "kizi: Top")
+
+        assert "KTO JESZCZE PISZE (profile z bazy)\nkizi: Top" in messages[0]["content"]
 
 
 @pytest.fixture
@@ -252,6 +360,7 @@ class TestConversation:
         assert "WIEDZA O GRACZU\nGracz: khal, rola w drużynie: ADC" in messages[0]["content"]
         assert "3 porażki z rzędu, LP paruje." in messages[0]["content"]
         assert messages[1:] == [{"role": "user", "content": "Kuba: czemu przegrał?"}]
+        assert roasts_cog.llm.chat.await_args.kwargs["latin_only"] is True
         stored = await db.get_chat_messages(chat_id)
         assert [(m["message_id"], m["role"]) for m in stored] == [
             (NOTIFICATION_ID, "game"), (COMMENT_ID, "comment"), (2000, "user"), (2001, "assistant")]
@@ -272,6 +381,15 @@ class TestConversation:
         # The game is fetched once, then kept with the conversation
         roast_chat.riot_api.get_match_details.assert_awaited_once()
         assert "Faza linii" in (await db.get_chat_by_bot_message(2003))["game_card"]
+
+    async def test_teammate_gets_answered_with_their_stats(self, chat_cog):
+        await add_kizi()
+        await start_chat()
+        await chat_cog.on_message(reply_to(COMMENT_ID, 2000, author_id=9, name="kizi", content="ale on intuje"))
+
+        system = roasts_cog.llm.chat.await_args.args[0][0]["content"]
+        assert "KTO JESZCZE PISZE (profile z bazy)\nkizi: Top, Master 124 LP" in system
+        assert "Ashe z tej gry" not in system  # the game isn't in khal's stored games here
 
     async def test_reply_to_a_notification_without_a_comment(self, chat_cog):
         await start_chat(comment=False)

@@ -15,3 +15,10 @@ def event_loop():
     loop = asyncio.get_event_loop_policy().new_event_loop()
     yield loop
     loop.close()
+
+
+@pytest.fixture(autouse=True)
+def no_player_profiles(monkeypatch, tmp_path):
+    """Tests don't read the real profiles.md (they write their own when they need one)."""
+    import player_profiles
+    monkeypatch.setattr(player_profiles, "PROFILES_PATH", tmp_path / "profiles.md")

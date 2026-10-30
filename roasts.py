@@ -3,6 +3,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 
 import llm
+import player_profiles
 from champions import champions
 from cogs.sheet import champion_display_name, SOLOQ_QUEUE
 from config import TIMEZONE
@@ -26,7 +27,7 @@ HISTORY_FOR_PROMPT = 10
 SYSTEM_PROMPT = """Jesteś złośliwym, ale lubianym kumplem z uczelnianej drużyny League of Legends i piszesz na Discordzie drużyny.
 Dostajesz dane o rankedowej grze kolegi i powód komentarza. Napisz krótki komentarz po polsku: 1-3 zdania, najwyżej 300 znaków.
 Styl: luźny, ironiczny, lekko toksyczny jak na czacie znajomych, gamingowy slang (int, feed, tilt, diff, gap). Pasują teksty w stylu „mój stary by lepiej zagrał tym Aatroxem, zostań przy swojej Camille”.
-Opieraj się wyłącznie na podanych danych, nie wymyślaj statystyk ani zdarzeń. Przy złej passie daj konkretną radę z danych: champion z jego puli z dobrym WR, przerwa, sen. Przy dobrej passie ironiczna pochwała.
+Opieraj się wyłącznie na podanych danych, nie wymyślaj statystyk ani zdarzeń. Opis od drużyny to wasze wewnętrzne żarty i ksywki: możesz je czasem wpleść, ale nie cytuj go w całości. Przy złej passie daj konkretną radę z danych: champion z jego puli z dobrym WR, przerwa, sen. Przy dobrej passie ironiczna pochwała.
 Lekkie przekleństwo może być, ale bez wyzwisk i bez żartów z wyglądu, pochodzenia, zdrowia czy orientacji. Nie zaczynaj od imienia ani pingu gracza (bot doda ping), najwyżej jedno emoji, bez cudzysłowu wokół całości."""
 
 
@@ -168,8 +169,9 @@ def build_prompt(nick: str, player: dict, stats: dict, trigger: dict, history: l
     """The facts the model gets about the game and the player."""
     pool = champion_pool(history)
     rank = f"{player['tier'].title()} {player['rank']} {player['lp']} LP" if player.get("tier") else "bez rangi"
+    description = player_profiles.profile(nick)
     lines = [
-        f"Gracz: {nick} ({rank})",
+        f"Gracz: {nick} ({rank})" + (f"\nOpis od drużyny: {description}" if description else ""),
         f"Powód komentarza: {trigger['reason']}",
         (
             f"Ta gra: {'wygrana' if stats['win'] else 'przegrana'} na {champion_display_name(stats['champion_name'])}"
@@ -211,7 +213,8 @@ def template_text(trigger: dict, stats: dict, history: list[dict]) -> str:
 
 async def write_comment(nick: str, player: dict, stats: dict, trigger: dict, history: list[dict], opponent: str | None) -> str:
     """The comment from the model, or from a template when the model isn't available."""
-    text = await llm.complete(SYSTEM_PROMPT, build_prompt(nick, player, stats, trigger, history, opponent), temperature=1.0)
+    text = await llm.complete(SYSTEM_PROMPT, build_prompt(nick, player, stats, trigger, history, opponent),
+                              temperature=1.0, latin_only=True)
     if text:
         return text.strip().strip('"„”')[:600]
     return template_text(trigger, stats, history)

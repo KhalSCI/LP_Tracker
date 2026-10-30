@@ -324,10 +324,14 @@ class LPTrackerBot(commands.Bot):
         """The player's roster row ("nick", "role", ...); None if not in it (e.g. an ex-member)."""
         if not GOOGLE_SHEET_ID:
             return {"nick": player.get("discord_name") or player["riot_id"], "role": ""}
-        for row in await team_sheet.read_roster_cached():
+        for row in await self.roster():
             if row["riot_id"].lower() == player["riot_id"].lower():
                 return dict(row, nick=row["nick"] or row["riot_id"])
         return None
+
+    async def roster(self) -> list[dict]:
+        """The roster sheet's rows as last read (empty without the sheet)."""
+        return await team_sheet.read_roster_cached() if GOOGLE_SHEET_ID else []
 
     @check_match_notifications.before_loop
     async def before_match_check(self):

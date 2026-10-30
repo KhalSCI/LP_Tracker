@@ -72,7 +72,8 @@ class RoastsCog(commands.Cog):
             if not game_card:
                 game_card = await roast_chat.load_game_card(chat["match_id"], chat["puuid"], nick)
                 await db.set_chat_game_card(chat["id"], game_card)
-            knowledge = await roast_chat.player_knowledge(player, nick, entry.get("role"), datetime.now(TIMEZONE))
+            now = datetime.now(TIMEZONE)
+            knowledge = await roast_chat.player_knowledge(player, nick, entry.get("role"), now, chat["match_id"])
             reply = {
                 "role": "user",
                 "author_id": message.author.id,
@@ -80,7 +81,11 @@ class RoastsCog(commands.Cog):
                 "content": message.clean_content[:roast_chat.MAX_MESSAGE_CHARS],
             }
             history = await db.get_chat_messages(chat["id"]) + [reply]
-            text = await llm.chat(roast_chat.build_messages(game_card, knowledge, history, owner_id), max_tokens=1500)
+            # Teammates writing in the conversation, so the bot can answer them with their own stats
+            authors = {m["author"] for m in roast_chat.recent_messages(history) if m["author_id"] != owner_id}
+            profiles = await roast_chat.author_profiles(authors, await self.bot.roster(), player["riot_id"], now)
+            messages = roast_chat.build_messages(game_card, knowledge, history, owner_id, profiles)
+            text = await llm.chat(messages, max_tokens=1500, latin_only=True)
             if not text:
                 return
             text = roast_chat.clean_answer(text)

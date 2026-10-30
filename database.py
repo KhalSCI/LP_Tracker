@@ -453,6 +453,17 @@ async def get_player_by_puuid(puuid: str) -> dict | None:
         return dict(row) if row else None
 
 
+async def get_player_by_riot_id(riot_id: str) -> dict | None:
+    """Get a tracked player by Riot ID, any leaderboard (the most recently updated row)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM players WHERE LOWER(riot_id) = LOWER(?) ORDER BY last_updated DESC LIMIT 1", (riot_id,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
 async def get_leaderboard_players(leaderboard_id: int) -> list[dict]:
     """Get all players for a leaderboard."""
     async with aiosqlite.connect(DB_PATH) as db:

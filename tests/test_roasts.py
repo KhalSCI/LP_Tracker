@@ -118,6 +118,15 @@ class TestTexts:
         assert "przeciwnik na linii: Kalista" in prompt
         assert "L Ashe 5/3/8, L Ashe 5/3/8, L Ashe 5/3/8, W Ashe 5/3/8" in prompt
 
+    def test_prompt_has_the_team_description(self):
+        import player_profiles
+        player_profiles.PROFILES_PATH.write_text("## khal\nADC i kapitan.\n", encoding="utf-8")
+        games = history(False, False, False, True)
+        prompt = build_prompt("khal", {"tier": None}, stats_for(games[0]),
+                              {"kind": "lose_streak", "reason": "3 porażki z rzędu"}, games, None)
+
+        assert prompt.startswith("Gracz: khal (bez rangi)\nOpis od drużyny: ADC i kapitan.\nPowód komentarza")
+
     def test_template_suggests_the_comfort_pick(self):
         comfort = [game(i % 4 != 0, "Camille", datetime(2026, 10, 20, tzinfo=TIMEZONE) - timedelta(hours=i)) for i in range(10)]
         games = history(False, False, False, champion="Aatrox") + comfort

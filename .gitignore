@@ -23,3 +23,6 @@ env/
 
 # Scrim uploads kept for troubleshooting
 uploads/
+
+# Descriptions of the players for the bot (personal, kept local)
+profiles.md
